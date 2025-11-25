@@ -118,6 +118,23 @@
 
       const { Nlevels, LSB, yClip, codes } = adcInfo
 
+      // Linhas da tabela (primeiras 50 amostras)
+      const sampleRows = useMemo(() => {
+        const maxRows = Math.min(50, tSamples.length)
+        const rows = []
+        for (let i = 0; i < maxRows; i++) {
+          const code = codes[i] ?? 0
+          const bin = code.toString(2).padStart(Math.max(1, nBits), '0')
+          rows.push({
+            idx: i,
+            analog: ySamples[i],
+            codeDec: code,
+            codeBin: bin
+          })
+        }
+        return rows
+      }, [tSamples.length, ySamples, codes, nBits])
+
       // Desenho no canvas
       const draw = useMemo(() => {
         return () => {
@@ -195,7 +212,6 @@
           ctx.strokeRect(left, top, W - left - right, H - top - bottom)
 
           // Eixo Y direito – códigos digitais
-          // usamos alguns níveis igualmente espaçados
           const nTicksDigital = Math.min(Nlevels, 5)
           const yt = []
           for (let i = 0; i < nTicksDigital; i++) {
@@ -381,6 +397,51 @@
             .dot { width:10px; height:10px; background:#ff3b3b; border-radius:50%; outline:2px solid #ffd2d2; }
             .range-line { width:18px; height:0; border-bottom:2px dashed #3b82f6; }
             .note { font-size:12px; color:#a8b2c8; margin-top:4px; }
+            .table-wrap {
+              margin-top:18px;
+              background:#121828;
+              border-radius:10px;
+              border:1px solid #1b2235;
+              padding:10px 12px 14px;
+            }
+            .table-wrap h2 {
+              margin:4px 0 10px;
+              font-size:16px;
+              font-weight:600;
+            }
+            table {
+              width:100%;
+              border-collapse:collapse;
+              font-size:13px;
+            }
+            th, td {
+              padding:6px 8px;
+              text-align:right;
+              border-bottom:1px solid #1f2937;
+              white-space:nowrap;
+            }
+            th:first-child, td:first-child {
+              text-align:center;
+            }
+            th {
+              background:#182032;
+              color:#e5e7eb;
+              position:sticky;
+              top:0;
+              z-index:1;
+            }
+            tbody tr:nth-child(odd) {
+              background:#101624;
+            }
+            tbody tr:nth-child(even) {
+              background:#0d1320;
+            }
+            .table-scroll {
+              max-height:260px;
+              overflow:auto;
+              border-radius:8px;
+              border:1px solid #1f2937;
+            }
             @media(max-width:900px) {
               .control { grid-column:span 12; }
             }
@@ -538,6 +599,35 @@
               Eixo Y esquerdo em volts; eixo Y direito mostra o código digital correspondente
               para os mesmos níveis de tensão. Quando o sinal excede [{vMin.toFixed(2)}, {vMax.toFixed(2)}] V,
               ele é saturado antes da quantização.
+            </div>
+
+            <div className="table-wrap">
+              <h2>Primeiras amostras (até 50)</h2>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Analógico (V)</th>
+                      <th>Código decimal</th>
+                      <th>Código binário</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sampleRows.map(row => (
+                      <tr key={row.idx}>
+                        <td>{row.idx}</td>
+                        <td>{row.analog.toFixed(4)}</td>
+                        <td>{row.codeDec}</td>
+                        <td>{row.codeBin}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="note">
+                Valores analógicos mostrados antes do clipping; códigos digitais calculados após saturação e quantização.
+              </div>
             </div>
           </div>
         </div>
