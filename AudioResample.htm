@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reamostragem e Quantização de Áudio (.wav)</title>
+</head>
+<body style="margin:0;background:#0f1420">
+  <div id="root"></div>
+
+  <!-- React 18 e ReactDOM 18 em UMD -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- Babel para transpilar JSX no navegador -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- App -->
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useMemo } = React;
+
+    function App() {
+      const [fileName, setFileName] = useState(null);
+      const [audioInfo, setAudioInfo] = useState(null);
+      const [targetFs, setTargetFs] = useState(8000);
+      const [nBits, setNBits] = useState(8);
+
+      const [status, setStatus] = useState('Selecione um arquivo .wav para começar.');
+      const [isBusy, setIsBusy] = useState(false);
+
+      const fileInputRef = useRef(null);
+      const decodeCtxRef = useRef(null);
+      const playCtxRef = useRef(null);
+      const srcNodeRef = useRef(null);
+      const originalBufferRef = useRef(null);
+
+      // Limpa playback
+      function stopPlayback() {
+        try {
+          if (srcNodeRef.current) srcNodeRef.current.stop();
+        } catch (_) {}
+        srcNodeRef.current = null;
+      }
+
+      useEffect(() => {
+        return () => {
+          stopPlayback();
+          if (decodeCtxRef.current) decodeCtxRef.current.close();
+          if (playCtxRef.current) playCtxRef.current.close();
+        };
+      }, []);
+
+      function clamp(v, lo, hi) {
+        if (Number.isNaN(v)) return lo;
+        return Math.max(lo, Math.min(hi, v));
+      }
+
+      function ensurePlayContext() {
+        if (playCtxRef.current && playCtxRef.current.state === "closed") {
+          playCtxRef.current = null;
+        }
+        if (!playCtxRef.current) {
+          playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        return playCtxRef.current;
+      }
+
+      async function handleFileChange(e) {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+
+        stopPlayback();
+        if (decodeCtxRef.current) {
+          try { await decodeCtxRef.current.close(); } catch (_) {}
+        }
+
+        setStatus("Carregando arquivo...");
+        setIsBusy(true);
+
+        try {
+          const arrayBuffer = await file.arrayBuffer();
+          const ctx = new AudioContext();
+          decodeCtxRef.current = ctx;
+
+          const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+          originalBufferRef.current = audioBuffer;
+
+          setAudioInfo({
+            sampleRate: audioBuffer.sampleRate,
+            duration: audioBuffer.duration,
+            channels: audioBuffer.numberOfChannels
+          });
+
+          setFileName(file.name);
+          setTargetFs(Math.max(1000, Math.min(48000, audioBuffer.sampleRate)));
+
+          setStatus("Arquivo carregado.");
+        } catch (err) {
+          console.error(err);
+          setStatus("Erro ao carregar arquivo.");
+        } finally {
+          setIsBusy(false);
+        }
+      }
+
+      async function handlePlayOriginal() {
+        const buffer = originalBufferRef.current;
+        if (!buffer) return;
+
+        stopPlayback();
+        const ctx = ensurePlayContext();
+
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        src.start();
+        srcNodeRef.current = src;
+
+        setStatus("Reproduzindo áudio original.");
+      }
+
+      async function handlePlayProcessed() {
+        const buffer = originalBufferRef.current;
+        if (!buffer) {
+          setStatus("Nenhum arquivo carregado.");
+          return;
+        }
+
+        const ctx = ensurePlayContext();
+        const fs0 = buffer.sampleRate;           // ex: 48000
+        const fsTargetRaw = Number(targetFs);
+        const fsTarget = clamp(fsTargetRaw, 1000, fs0);
+
+        stopPlayback();
+        setIsBusy(true);
+        setStatus("Processando áudio...");
+
+        try {
+          const channels = buffer.numberOfChannels;
+          const length = buffer.length;
+          const r = Math.max(1, Math.round(fs0 / fsTarget));
+          const bits = clamp(Number(nBits), 2, 24);
+          const maxInt = Math.pow(2, bits - 1) - 1;
+
+          const processed = ctx.createBuffer(channels, length, fs0);
+
+          for (let ch = 0; ch < channels; ch++) {
+            const input = buffer.getChannelData(ch);
+            const output = processed.getChannelData(ch);
+
+            for (let n = 0; n < length; n++) {
+              const blk = Math.floor(n / r);
+              const srcIdx = Math.min(blk * r, length - 1);
+
+              let v = input[srcIdx];
+              if (v > 1) v = 1;
+              else if (v < -1) v = -1;
+
+              const q = Math.round(v * maxInt) / maxInt;
+              output[n] = q;
+            }
+          }
+
+          const src = ctx.createBufferSource();
+          src.buffer = processed;
+          src.connect(ctx.destination);
+          src.start();
+          srcNodeRef.current = src;
+
+          const fsEfetiva = fs0 / Math.round(fs0 / fsTarget);
+
+          setStatus(`Reproduzindo áudio processado: fs ≈ ${fsEfetiva.toFixed(0)} Hz, ${bits} bits.`);
+        } catch (err) {
+          console.error(err);
+          setStatus("Erro ao processar áudio.");
+        } finally {
+          setIsBusy(false);
+        }
+      }
+
+      const minFs = 1000;
+      const maxFs = 48000;
+
+      return (
+        <div className="wrap">
+          <style>{`
+            :root {
+              --bg:#0f1420;
+              --panel:#151b2a;
+              --ink:#e8eefc;
+              --ink-dim:#a8b2c8;
+              --accent:#4da3ff;
+            }
+            * { box-sizing:border-box; }
+            body {
+              margin:0;
+              font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto;
+              background:var(--bg);
+              color:var(--ink);
+            }
+            .wrap { max-width:1100px; margin:0 auto; padding:20px; }
+            h1 { text-align:center; font-size:20px; margin-bottom:4px; }
+            .subtitle { text-align:center; color:var(--ink-dim); margin-bottom:14px; }
+            .panel {
+              background:var(--panel);
+              border:1px solid #1b2235;
+              border-radius:10px;
+              padding:14px;
+              box-shadow:0 6px 18px rgba(0,0,0,.25);
+            }
+            .control {
+              margin:12px 0;
+              padding:10px;
+              background:#121828;
+              border-radius:10px;
+              border:1px solid #1b2235;
+            }
+            .actions { display:flex; gap:10px; margin-top:14px; }
+            .btn {
+              padding:8px 16px;
+              border-radius:999px;
+              border:1px solid #273453;
+              background:#1a2236;
+              color:white;
+              cursor:pointer;
+            }
+            .btn-primary {
+              background:linear-gradient(135deg,#2563eb,#38bdf8);
+            }
+            input[type=range] { width:100%; accent-color:var(--accent); }
+            input[type=number] {
+              width:90px;
+              padding:6px;
+              border-radius:6px;
+              border:1px solid #273453;
+              background:#0e1424;
+              color:white;
+            }
+            .status { margin-top:12px; color:var(--ink-dim);}
+          `}</style>
+
+          <h1>Reamostragem e Quantização de Áudio (.wav)</h1>
+          <div className="subtitle">Ouça como o áudio ficaria com outra frequência de amostragem e número de bits.</div>
+
+          <div className="panel">
+
+            <div className="control">
+              <label>Selecione um arquivo .wav</label><br/>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".wav,audio/wav"
+                onChange={handleFileChange}
+                style={{ marginTop:"6px" }}
+              />
+              <div style={{ marginTop:"6px", color:"var(--ink-dim)" }}>
+                {fileName ?? "Nenhum arquivo selecionado"}
+              </div>
+            </div>
+
+            <div className="control">
+              <label>Nova frequência de amostragem (Hz)</label>
+              <input
+                type="range"
+                min={minFs}
+                max={maxFs}
+                step="500"
+                value={targetFs}
+                onChange={(e)=>setTargetFs(Number(e.target.value))}
+              />
+              <input
+                type="number"
+                min={minFs}
+                max={maxFs}
+                step="500"
+                value={targetFs}
+                onChange={(e)=>setTargetFs(clamp(Number(e.target.value), minFs, maxFs))}
+              />
+            </div>
+
+            <div className="control">
+              <label>Resolução (bits)</label>
+              <input
+                type="range"
+                min="2"
+                max="24"
+                step="1"
+                value={nBits}
+                onChange={(e)=>setNBits(Number(e.target.value))}
+              />
+              <input
+                type="number"
+                min="2"
+                max="24"
+                step="1"
+                value={nBits}
+                onChange={(e)=>setNBits(clamp(Number(e.target.value), 2, 24))}
+              />
+            </div>
+
+            <div className="actions">
+              <button className="btn" onClick={handlePlayOriginal} disabled={!originalBufferRef.current || isBusy}>
+                Ouvir original
+              </button>
+
+              <button className="btn btn-primary" onClick={handlePlayProcessed} disabled={!originalBufferRef.current || isBusy}>
+                Ouvir com nova configuração
+              </button>
+            </div>
+
+            <div className="status">{status}</div>
+
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
