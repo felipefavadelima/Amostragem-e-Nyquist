@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Amostras de Áudio (.wav) – Tabela, Gráfico e Reprodução</title>
+</head>
+<body style="margin:0;background:#0f1420">
+  <div id="root"></div>
+
+  <!-- React 18 e ReactDOM 18 em UMD -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- Babel para transpilar JSX no navegador -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- App -->
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useMemo } = React
+
+    function App() {
+      const [fileName, setFileName] = useState(null)
+      const [audioInfo, setAudioInfo] = useState(null) // {sampleRate, duration, channels, length}
+      const [status, setStatus] = useState('Selecione um arquivo .wav para começar.')
+      const [isBusy, setIsBusy] = useState(false)
+      const [maxRows, setMaxRows] = useState(2000)
+
+      const fileInputRef = useRef(null)
+      const decodeCtxRef = useRef(null)
+      const originalBufferRef = useRef(null)
+      const canvasRef = useRef(null)
+
+      // Para reprodução
+      const playCtxRef = useRef(null)
+      const srcNodeRef = useRef(null)
+
+      function clamp(v, lo, hi) {
+        if (Number.isNaN(v)) return lo
+        return Math.max(lo, Math.min(hi, v))
+      }
+
+      function stopPlayback() {
+        try {
+          if (srcNodeRef.current) srcNodeRef.current.stop()
+        } catch (_) {}
+        srcNodeRef.current = null
+      }
+
+      function ensurePlayContext() {
+        const AC = window.AudioContext || window.webkitAudioContext
+        if (!AC) return null
+        if (playCtxRef.current && playCtxRef.current.state === 'closed') {
+          playCtxRef.current = null
+        }
+        if (!playCtxRef.current) {
+          playCtxRef.current = new AC()
+        }
+        return playCtxRef.current
+      }
+
+      useEffect(() => {
+        return () => {
+          stopPlayback()
+          if (decodeCtxRef.current) {
+            try { decodeCtxRef.current.close() } catch (_) {}
+          }
+          if (playCtxRef.current) {
+            try { playCtxRef.current.close() } catch (_) {}
+          }
+        }
+      }, [])
+
+      async function handleFileChange(e) {
+        const file = e.target.files && e.target.files[0]
+        if (!file) return
+
+        stopPlayback()
+
+        if (decodeCtxRef.current) {
+          try { await decodeCtxRef.current.close() } catch (_) {}
+          decodeCtxRef.current = null
+        }
+
+        setStatus('Carregando e decodificando arquivo .wav...')
+        setIsBusy(true)
+        setFileName(file.name || 'arquivo.wav')
+        originalBufferRef.current = null
+        setAudioInfo(null)
+
+        try {
+          const arrayBuffer = await file.arrayBuffer()
+          const AC = window.AudioContext || window.webkitAudioContext
+          if (!AC) {
+            setStatus('Este navegador não suporta Web Audio API.')
+            return
+          }
+          const ctx = new AC()
+          decodeCtxRef.current = ctx
+
+          const audioBuffer = await ctx.decodeAudioData(arrayBuffer)
+          originalBufferRef.current = audioBuffer
+
+          const info = {
+            sampleRate: audioBuffer.sampleRate,
+            duration: audioBuffer.duration,
+            channels: audioBuffer.numberOfChannels,
+            length: audioBuffer.length
+          }
+          setAudioInfo(info)
+
+          setStatus('Arquivo carregado. Tabela, gráfico e reprodução disponíveis.')
+        } catch (err) {
+          console.error(err)
+          setStatus('Erro ao carregar/decodificar o arquivo. Verifique se é um .wav válido.')
+          originalBufferRef.current = null
+          setAudioInfo(null)
+        } finally {
+          setIsBusy(false)
+        }
+      }
+
+      async function handlePlayAudio() {
+        const buffer = originalBufferRef.current
+        if (!buffer) {
+          setStatus('Nenhum arquivo carregado.')
+          return
+        }
+
+        const ctx = ensurePlayContext()
+        if (!ctx) {
+          setStatus('Este navegador não suporta Web Audio API.')
+          return
+        }
+
+        stopPlayback()
+        try {
+          const src = ctx.createBufferSource()
+          src.buffer = buffer
+          src.connect(ctx.destination)
+          src.start()
+          srcNodeRef.current = src
+
+          setStatus('Reproduzindo áudio original do arquivo .wav.')
+        } catch (err) {
+          console.error(err)
+          setStatus('Erro ao reproduzir o áudio.')
+        }
+      }
+
+      const displayInfo = useMemo(() => {
+        if (!audioInfo) return null
+        const dur = audioInfo.duration
+        const min = Math.floor(dur / 60)
+        const sec = Math.round(dur - min * 60)
+        return {
+          sr: audioInfo.sampleRate.toFixed(0),
+          durText: `${min} min ${sec.toString().padStart(2, '0')} s`,
+          chText: audioInfo.channels === 1
+            ? '1 canal (mono)'
+            : audioInfo.channels === 2
+              ? '2 canais (stereo)'
+              : `${audioInfo.channels} canais`,
+          lenText: audioInfo.length.toLocaleString('pt-BR')
+        }
+      }, [audioInfo])
+
+      const rows = useMemo(() => {
+        const buffer = originalBufferRef.current
+        if (!buffer) return []
+
+        const len = buffer.length
+        const n = Math.min(len, clamp(maxRows, 1, 200000))
+        const chCount = buffer.numberOfChannels
+        const ch0 = buffer.getChannelData(0)
+        const ch1 = chCount > 1 ? buffer.getChannelData(1) : null
+
+        const out = new Array(n)
+        for (let i = 0; i < n; i++) {
+          out[i] = {
+            idx: i,
+            c1: ch0[i],
+            c2: ch1 ? ch1[i] : null
+          }
+        }
+        return out
+      }, [audioInfo, maxRows])
+
+      const hasChannel2 = audioInfo && audioInfo.channels > 1
+      const fileLabel = fileName || 'Nenhum arquivo selecionado'
+
+      // Desenho do gráfico
+      useEffect(() => {
+        const canvas = canvasRef.current
+        const buffer = originalBufferRef.current
+        if (!canvas) return
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return
+
+        const dpr = window.devicePixelRatio || 1
+        const cw = canvas.clientWidth || 800
+        const ch = canvas.clientHeight || 260
+        canvas.width = cw * dpr
+        canvas.height = ch * dpr
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+        const W = cw
+        const H = ch
+
+        ctx.fillStyle = '#0d1322'
+        ctx.fillRect(0, 0, W, H)
+
+        if (!buffer || !audioInfo || rows.length === 0) {
+          return
+        }
+
+        const left = 48
+        const right = 20
+        const top = 16
+        const bottom = 32
+
+        const fs = audioInfo.sampleRate
+        const lastIdx = rows[rows.length - 1].idx
+        const tMax = lastIdx / fs || 1
+
+        function xScale(t) {
+          return left + (W - left - right) * (t / tMax)
+        }
+        function yScale(v) {
+          const vMin = -1.1
+          const vMax = 1.1
+          const p = (v - vMin) / (vMax - vMin)
+          return H - bottom - p * (H - top - bottom)
+        }
+
+        // Grade
+        ctx.strokeStyle = '#1f2937'
+        ctx.lineWidth = 1
+        ctx.font = '11px system-ui, sans-serif'
+        ctx.fillStyle = '#a8b2c8'
+
+        // Grid vertical (tempo)
+        const gridX = 6
+        for (let i = 0; i < gridX; i++) {
+          const tt = (tMax * i) / (gridX - 1 || 1)
+          const x = xScale(tt)
+          ctx.beginPath()
+          ctx.moveTo(x, top)
+          ctx.lineTo(x, H - bottom)
+          ctx.stroke()
+          ctx.textAlign = 'center'
+          ctx.fillText(tt.toFixed(3), x, H - 16)
+        }
+
+        // Grid horizontal (amplitude)
+        const yTicksVals = [-1, -0.5, 0, 0.5, 1]
+        yTicksVals.forEach(v => {
+          const y = yScale(v)
+          ctx.beginPath()
+          ctx.moveTo(left, y)
+          ctx.lineTo(W - right, y)
+          ctx.stroke()
+          ctx.textAlign = 'right'
+          ctx.fillText(v.toFixed(1), left - 4, y + 4)
+        })
+
+        // Moldura
+        ctx.strokeStyle = '#223252'
+        ctx.strokeRect(left, top, W - left - right, H - top - bottom)
+
+        // Rótulos
+        ctx.fillStyle = '#c6d0f5'
+        ctx.font = '12px system-ui,sans-serif'
+        ctx.textAlign = 'center'
+        ctx.fillText('Tempo (s)', (left + W - right) / 2, H - 4)
+
+        ctx.save()
+        ctx.translate(12, H / 2)
+        ctx.rotate(-Math.PI / 2)
+        ctx.textAlign = 'center'
+        ctx.fillText('Amplitude (valor decimal normalizado)', 0, 0)
+        ctx.restore()
+
+        // Canal 1
+        ctx.lineWidth = 1.5
+        ctx.strokeStyle = '#38bdf8'
+        ctx.beginPath()
+        rows.forEach((row, idx) => {
+          const t = row.idx / fs
+          const x = xScale(t)
+          const y = yScale(row.c1)
+          if (idx === 0) ctx.moveTo(x, y)
+          else ctx.lineTo(x, y)
+        })
+        ctx.stroke()
+
+        // Canal 2 (se existir)
+        if (hasChannel2) {
+          ctx.strokeStyle = '#f97316'
+          ctx.beginPath()
+          rows.forEach((row, idx) => {
+            const t = row.idx / fs
+            const x = xScale(t)
+            const y = yScale(row.c2 ?? 0)
+            if (idx === 0) ctx.moveTo(x, y)
+            else ctx.lineTo(x, y)
+          })
+          ctx.stroke()
+        }
+
+        // Legenda
+        ctx.font = '11px system-ui,sans-serif'
+        ctx.textAlign = 'left'
+        const lx = left + 6
+        let ly = top + 12
+        ctx.fillStyle = '#38bdf8'
+        ctx.fillRect(lx, ly - 6, 12, 2)
+        ctx.fillStyle = '#cbd5f5'
+        ctx.fillText('Canal 1', lx + 20, ly - 2)
+
+        if (hasChannel2) {
+          ly += 14
+          ctx.fillStyle = '#f97316'
+          ctx.fillRect(lx, ly - 6, 12, 2)
+          ctx.fillStyle = '#cbd5f5'
+          ctx.fillText('Canal 2', lx + 20, ly - 2)
+        }
+      }, [rows, audioInfo, hasChannel2])
+
+      return (
+        <div className="wrap">
+          <style>{`
+            :root {
+              --bg:#0f1420;
+              --panel:#151b2a;
+              --ink:#e8eefc;
+              --ink-dim:#a8b2c8;
+              --accent:#4da3ff;
+            }
+            * { box-sizing:border-box; }
+            body {
+              margin:0;
+              background:var(--bg);
+              color:var(--ink);
+              font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto;
+            }
+            .wrap {
+              max-width:1100px;
+              margin:0 auto;
+              padding:18px 14px 40px;
+            }
+            h1 {
+              margin:4px 0 4px;
+              font-size:20px;
+              font-weight:700;
+              letter-spacing:.2px;
+              text-align:center;
+            }
+            .subtitle {
+              text-align:center;
+              font-size:13px;
+              color:var(--ink-dim);
+              margin-bottom:14px;
+            }
+            .panel {
+              background:var(--panel);
+              border:1px solid #1b2235;
+              border-radius:10px;
+              padding:12px;
+              box-shadow:0 6px 18px rgba(0,0,0,.25);
+            }
+            .file-row {
+              display:flex;
+              flex-wrap:wrap;
+              gap:10px;
+              align-items:center;
+              background:#121828;
+              border-radius:10px;
+              border:1px solid #1b2235;
+              padding:10px 12px;
+              margin-bottom:12px;
+            }
+            .file-input-hidden {
+              display:none;
+            }
+            .file-button {
+              position:relative;
+              display:inline-flex;
+              align-items:center;
+              gap:8px;
+              padding:8px 14px;
+              border-radius:999px;
+              border:1px solid #273453;
+              background:#10172a;
+              color:var(--ink);
+              font-size:14px;
+              cursor:pointer;
+              transition:background .15s, transform .05s, box-shadow .1s;
+              box-shadow:0 4px 10px rgba(0,0,0,.35);
+            }
+            .file-button:hover {
+              background:#182033;
+            }
+            .file-button:active {
+              transform:translateY(1px);
+              box-shadow:0 2px 6px rgba(0,0,0,.4);
+            }
+            .icon-circle {
+              width:18px;
+              height:18px;
+              border-radius:50%;
+              border:2px solid var(--accent);
+              display:flex;
+              align-items:center;
+              justify-content:center;
+              font-size:11px;
+              color:var(--accent);
+            }
+            .file-name {
+              font-size:13px;
+              color:var(--ink-dim);
+              min-width:0;
+              flex:1;
+              white-space:nowrap;
+              overflow:hidden;
+              text-overflow:ellipsis;
+            }
+            .meta {
+              display:flex;
+              flex-wrap:wrap;
+              gap:8px;
+              margin-bottom:12px;
+              font-size:13px;
+            }
+            .pill {
+              background:#10172a;
+              border:1px solid #273453;
+              padding:6px 10px;
+              border-radius:999px;
+              display:inline-flex;
+              gap:6px;
+              align-items:center;
+              color:var(--ink-dim);
+            }
+            .pill strong { color:var(--ink); }
+            .control-row {
+              display:flex;
+              flex-wrap:wrap;
+              gap:10px;
+              align-items:center;
+              background:#121828;
+              border-radius:10px;
+              border:1px solid #1b2235;
+              padding:10px 12px;
+              margin-bottom:12px;
+              font-size:13px;
+              color:var(--ink-dim);
+            }
+            .control-row label {
+              margin-right:6px;
+            }
+            input[type=number] {
+              width:100px;
+              background:#0e1424;
+              color:#e8eefc;
+              border:1px solid #2a3859;
+              border-radius:8px;
+              padding:6px 8px;
+              font-size:14px;
+            }
+            .table-wrap {
+              margin-top:8px;
+              background:#121828;
+              border-radius:10px;
+              border:1px solid #1b2235;
+              padding:10px 12px 14px;
+            }
+            .table-wrap h2 {
+              margin:4px 0 8px;
+              font-size:16px;
+              font-weight:600;
+            }
+            .table-scroll {
+              max-height:420px;
+              overflow:auto;
+              border-radius:8px;
+              border:1px solid #1f2937;
+            }
+            table {
+              width:100%;
+              border-collapse:collapse;
+              font-size:13px;
+            }
+            th, td {
+              padding:6px 8px;
+              text-align:right;
+              border-bottom:1px solid #1f2937;
+              white-space:nowrap;
+            }
+            th:first-child, td:first-child {
+              text-align:center;
+            }
+            th {
+              background:#182032;
+              color:#e5e7eb;
+              position:sticky;
+              top:0;
+              z-index:1;
+            }
+            tbody tr:nth-child(odd) {
+              background:#101624;
+            }
+            tbody tr:nth-child(even) {
+              background:#0d1320;
+            }
+            .plot-wrap {
+              margin-top:16px;
+              background:#121828;
+              border-radius:10px;
+              border:1px solid #1b2235;
+              padding:10px 12px 14px;
+            }
+            .plot-wrap h2 {
+              margin:4px 0 8px;
+              font-size:16px;
+              font-weight:600;
+            }
+            canvas.wave-canvas {
+              width:100%;
+              height:260px;
+              display:block;
+              background:#0d1322;
+              border-radius:10px;
+              border:1px solid #1b2235;
+            }
+            .status {
+              margin-top:10px;
+              font-size:13px;
+              color:var(--ink-dim);
+            }
+            .note {
+              font-size:12px;
+              color:#a8b2c8;
+              margin-top:6px;
+            }
+            .actions {
+              margin-bottom:12px;
+              display:flex;
+              flex-wrap:wrap;
+              gap:10px;
+            }
+            .btn {
+              display:inline-flex;
+              align-items:center;
+              justify-content:center;
+              padding:8px 16px;
+              border-radius:999px;
+              border:1px solid #273453;
+              background:#1a2236;
+              color:var(--ink);
+              font-size:14px;
+              cursor:pointer;
+              box-shadow:0 4px 10px rgba(0,0,0,.35);
+              transition:background .15s, transform .05s, box-shadow .1s, opacity .1s;
+            }
+            .btn:hover {
+              background:#222b43;
+            }
+            .btn:active {
+              transform:translateY(1px);
+              box-shadow:0 2px 6px rgba(0,0,0,.4);
+            }
+            .btn[disabled] {
+              opacity:0.6;
+              cursor:not-allowed;
+              box-shadow:none;
+              transform:none;
+            }
+          `}</style>
+
+          <h1>Tabela de Amostras de Áudio (.wav)</h1>
+          <div className="subtitle">
+            Carregue um arquivo .wav, visualize as amostras em decimal, veja o gráfico no tempo e escute o áudio original.
+          </div>
+
+          <div className="panel">
+            {/* Seleção de arquivo */}
+            <div className="file-row">
+              <div style={{flex:'1 1 auto', minWidth:0}}>
+                <div style={{fontSize:'13px',color:'var(--ink-dim)',marginBottom:'4px'}}>
+                  Arquivo de áudio (.wav)
+                </div>
+                <div style={{display:'flex',alignItems:'center',gap:'10px'}}>
+                  <button
+                    type="button"
+                    className="file-button"
+                    onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                    disabled={isBusy}
+                  >
+                    <span className="icon-circle">♪</span>
+                    <span>Selecionar arquivo</span>
+                  </button>
+                  <span className="file-name" title={fileLabel}>{fileLabel}</span>
+                </div>
+              </div>
+              <input
+                ref={fileInputRef}
+                className="file-input-hidden"
+                type="file"
+                accept=".wav,audio/wav,audio/x-wav"
+                onChange={handleFileChange}
+              />
+            </div>
+
+            {/* Metadados do áudio */}
+            {audioInfo && (
+              <div className="meta">
+                <span className="pill">
+                  <strong>fs:</strong> {displayInfo.sr} Hz
+                </span>
+                <span className="pill">
+                  <strong>Duração:</strong> {displayInfo.durText}
+                </span>
+                <span className="pill">
+                  <strong>Canais:</strong> {displayInfo.chText}
+                </span>
+                <span className="pill">
+                  <strong>N amostras:</strong> {displayInfo.lenText}
+                </span>
+              </div>
+            )}
+
+            {/* Botão de play */}
+            <div className="actions">
+              <button
+                type="button"
+                className="btn"
+                onClick={handlePlayAudio}
+                disabled={!audioInfo || isBusy}
+              >
+                ▶ Ouvir áudio original
+              </button>
+            </div>
+
+            {/* Controle de quantidade de amostras */}
+            <div className="control-row">
+              <label htmlFor="maxRows">Quantidade de amostras a mostrar (a partir do início):</label>
+              <input
+                id="maxRows"
+                type="number"
+                min="1"
+                max="200000"
+                step="100"
+                value={maxRows}
+                onChange={e => setMaxRows(clamp(Number(e.target.value), 1, 200000))}
+              />
+              <span>
+                (máx. 200.000 para não travar o navegador)
+              </span>
+            </div>
+
+            {/* Tabela de amostras */}
+            <div className="table-wrap">
+              <h2>Primeiras amostras do arquivo .wav</h2>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Canal 1</th>
+                      {hasChannel2 && <th>Canal 2</th>}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map(row => (
+                      <tr key={row.idx}>
+                        <td>{row.idx}</td>
+                        <td>{row.c1.toFixed(6)}</td>
+                        {hasChannel2 && (
+                          <td>{row.c2 !== null ? row.c2.toFixed(6) : ''}</td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="note">
+                Valores em ponto flutuante no intervalo aproximado [-1, 1], conforme representação interna da Web Audio API.
+                Para arquivos com mais de 2 canais, apenas os dois primeiros são mostrados aqui.
+              </div>
+            </div>
+
+            {/* Gráfico das amostras */}
+            <div className="plot-wrap">
+              <h2>Gráfico das amostras selecionadas</h2>
+              <canvas
+                ref={canvasRef}
+                className="wave-canvas"
+                aria-label="Forma de onda das amostras selecionadas">
+              </canvas>
+              <div className="note">
+                Eixo X em tempo (segundos); eixo Y em amplitude normalizada (valores decimais).
+                O gráfico utiliza as mesmas amostras exibidas na tabela acima.
+              </div>
+            </div>
+
+            <div className="status">
+              <strong>Status:</strong> {status}
+            </div>
+          </div>
+        </div>
+      )
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'))
+    root.render(<App />)
+  </script>
+</body>
+</html>
