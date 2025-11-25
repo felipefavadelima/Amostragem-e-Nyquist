@@ -116,7 +116,7 @@
         return { Nlevels, LSB, yClip, codes, yQuant }
       }, [ySamples, vMin, vMax, nBits])
 
-      const { Nlevels, LSB, yClip, codes } = adcInfo
+      const { Nlevels, LSB, yClip, codes, yQuant } = adcInfo
 
       // Linhas da tabela (primeiras 50 amostras)
       const sampleRows = useMemo(() => {
@@ -263,18 +263,19 @@
           }
           ctx.stroke()
 
-          // Pontos amostrados (já saturados)
-          ctx.fillStyle = '#ff3b3b'
-          ctx.strokeStyle = '#ffd2d2'
-          for (let i = 0; i < tSamples.length; i++) {
-            const x = xScale(tSamples[i])
-            const y = yScale(yClip[i])
-            ctx.beginPath()
-            ctx.arc(x, y, 4, 0, TWO_PI)
-            ctx.fill()
-            ctx.lineWidth = 1
-            ctx.stroke()
-          }
+          // Pontos amostrados (valor quantizado em volts)
+		ctx.fillStyle = '#ff3b3b'
+		ctx.strokeStyle = '#ffd2d2'
+		for (let i = 0; i < tSamples.length; i++) {
+		  const x = xScale(tSamples[i])
+		  const y = yScale(yQuant[i])   // <-- agora usa o valor quantizado
+		  ctx.beginPath()
+		  ctx.arc(x, y, 4, 0, TWO_PI)
+		  ctx.fill()
+		  ctx.lineWidth = 1
+		  ctx.stroke()
+}
+
 
           // Linha marcando Vmin e Vmax
           ctx.setLineDash([6, 4])
