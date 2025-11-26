@@ -16,7 +16,7 @@
 
   <!-- App -->
   <script type="text/babel">
-    const { useState, useRef, useEffect, useMemo } = React;
+    const { useState, useRef, useEffect } = React;
 
     function App() {
       const [fileName, setFileName] = useState(null);
@@ -33,7 +33,11 @@
       const srcNodeRef = useRef(null);
       const originalBufferRef = useRef(null);
 
-      // Limpa playback
+      function clamp(v, lo, hi) {
+        if (Number.isNaN(v)) return lo;
+        return Math.max(lo, Math.min(hi, v));
+      }
+
       function stopPlayback() {
         try {
           if (srcNodeRef.current) srcNodeRef.current.stop();
@@ -41,28 +45,29 @@
         srcNodeRef.current = null;
       }
 
-      useEffect(() => {
-        return () => {
-          stopPlayback();
-          if (decodeCtxRef.current) decodeCtxRef.current.close();
-          if (playCtxRef.current) playCtxRef.current.close();
-        };
-      }, []);
-
-      function clamp(v, lo, hi) {
-        if (Number.isNaN(v)) return lo;
-        return Math.max(lo, Math.min(hi, v));
-      }
-
       function ensurePlayContext() {
-        if (playCtxRef.current && playCtxRef.current.state === "closed") {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        if (playCtxRef.current && playCtxRef.current.state === 'closed') {
           playCtxRef.current = null;
         }
         if (!playCtxRef.current) {
-          playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+          playCtxRef.current = new AC();
         }
         return playCtxRef.current;
       }
+
+      useEffect(() => {
+        return () => {
+          stopPlayback();
+          if (decodeCtxRef.current) {
+            try { decodeCtxRef.current.close(); } catch (_) {}
+          }
+          if (playCtxRef.current) {
+            try { playCtxRef.current.close(); } catch (_) {}
+          }
+        };
+      }, []);
 
       async function handleFileChange(e) {
         const file = e.target.files && e.target.files[0];
@@ -71,6 +76,7 @@
         stopPlayback();
         if (decodeCtxRef.current) {
           try { await decodeCtxRef.current.close(); } catch (_) {}
+          decodeCtxRef.current = null;
         }
 
         setStatus("Carregando arquivo...");
@@ -78,7 +84,13 @@
 
         try {
           const arrayBuffer = await file.arrayBuffer();
-          const ctx = new AudioContext();
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) {
+            setStatus("Este navegador não suporta Web Audio API.");
+            setIsBusy(false);
+            return;
+          }
+          const ctx = new AC();
           decodeCtxRef.current = ctx;
 
           const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
@@ -91,6 +103,7 @@
           });
 
           setFileName(file.name);
+          // valor inicial razoável
           setTargetFs(Math.max(1000, Math.min(48000, audioBuffer.sampleRate)));
 
           setStatus("Arquivo carregado.");
@@ -104,18 +117,30 @@
 
       async function handlePlayOriginal() {
         const buffer = originalBufferRef.current;
-        if (!buffer) return;
+        if (!buffer) {
+          setStatus("Nenhum arquivo carregado.");
+          return;
+        }
+
+        const ctx = ensurePlayContext();
+        if (!ctx) {
+          setStatus("Este navegador não suporta Web Audio API.");
+          return;
+        }
 
         stopPlayback();
-        const ctx = ensurePlayContext();
 
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(ctx.destination);
-        src.start();
-        srcNodeRef.current = src;
-
-        setStatus("Reproduzindo áudio original.");
+        try {
+          const src = ctx.createBufferSource();
+          src.buffer = buffer;
+          src.connect(ctx.destination);
+          src.start();
+          srcNodeRef.current = src;
+          setStatus("Reproduzindo áudio original.");
+        } catch (err) {
+          console.error(err);
+          setStatus("Erro ao reproduzir o áudio.");
+        }
       }
 
       async function handlePlayProcessed() {
@@ -126,59 +151,78 @@
         }
 
         const ctx = ensurePlayContext();
-        const fs0 = buffer.sampleRate;           // ex: 48000
-        const fsTargetRaw = Number(targetFs);
-        const fsTarget = clamp(fsTargetRaw, 1000, fs0);
+        if (!ctx) {
+          setStatus("Este navegador não suporta Web Audio API.");
+          return;
+        }
+
+        const fs0 = buffer.sampleRate;       // taxa do arquivo
+        const fsPlay = ctx.sampleRate;       // taxa do contexto (hardware)
+        const fsTargetRaw = Number(targetFs) || 8000;
+
+        // fs "desejada" para o ADC (conceitual)
+        const fsTargetClamped = clamp(fsTargetRaw, 200, fs0);
+
+        // fator de dizimação inteiro para simular amostragem em fsADC
+        const r = Math.max(1, Math.round(fs0 / fsTargetClamped));
+        const fsEff = fs0 / r;   // taxa de amostragem efetiva do ADC
 
         stopPlayback();
         setIsBusy(true);
-        setStatus("Processando áudio...");
+        setStatus("Processando áudio (dizimação sem filtro + quantização)...");
 
         try {
-          const channels = buffer.numberOfChannels;
           const length = buffer.length;
-          const r = Math.max(1, Math.round(fs0 / fsTarget));
-          const bits = clamp(Number(nBits), 2, 24);
+          const channels = buffer.numberOfChannels;
+
+          // número de amostras que o contexto vai tocar
+          const Nplay = Math.max(1, Math.round(buffer.duration * fsPlay));
+
+          const bits = clamp(Number(nBits) || 8, 2, 24);
           const maxInt = Math.pow(2, bits - 1) - 1;
 
           const processed = ctx.createBuffer(channels, length, fs0);
 
           for (let ch = 0; ch < channels; ch++) {
-            const input = buffer.getChannelData(ch);
-            const output = processed.getChannelData(ch);
+            const inData = buffer.getChannelData(ch);
+            const outData = processed.getChannelData(ch);
 
+            // Para cada amostra em fs0, escolhemos uma amostra "dizimada" x[k] = x[k*r]
+            // e repetimos essa amostra por r pontos (zero-order hold).
             for (let n = 0; n < length; n++) {
-              const blk = Math.floor(n / r);
-              const srcIdx = Math.min(blk * r, length - 1);
+              const k = Math.floor(n / r);
+              const idx = Math.min(k * r, length - 1);
+              let v = inData[idx];
 
-              let v = input[srcIdx];
+              // quantização em n bits
               if (v > 1) v = 1;
               else if (v < -1) v = -1;
-
               const q = Math.round(v * maxInt) / maxInt;
-              output[n] = q;
+
+              outData[n] = q;
             }
           }
 
           const src = ctx.createBufferSource();
-          src.buffer = processed;
+          src.buffer = processed;             // fs0 → reproduzido em fsPlay com resampling interno
           src.connect(ctx.destination);
           src.start();
           srcNodeRef.current = src;
 
-          const fsEfetiva = fs0 / Math.round(fs0 / fsTarget);
-
-          setStatus(`Reproduzindo áudio processado: fs ≈ ${fsEfetiva.toFixed(0)} Hz, ${bits} bits.`);
+          setStatus(
+            `Reproduzindo processado: fs pedido ≈ ${fsTargetClamped.toFixed(0)} Hz, ` +
+            `fs efetiva = ${(fsEff).toFixed(0)} Hz, ${bits} bits.`
+          );
         } catch (err) {
           console.error(err);
-          setStatus("Erro ao processar áudio.");
+          setStatus("Erro ao processar o áudio.");
         } finally {
           setIsBusy(false);
         }
       }
 
-      const minFs = 1000;
-      const maxFs = 48000;
+      const minFsUi = 200;
+      const maxFsUi = 48000;
 
       return (
         <div className="wrap">
@@ -214,7 +258,7 @@
               border-radius:10px;
               border:1px solid #1b2235;
             }
-            .actions { display:flex; gap:10px; margin-top:14px; }
+            .actions { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; }
             .btn {
               padding:8px 16px;
               border-radius:999px;
@@ -226,6 +270,10 @@
             .btn-primary {
               background:linear-gradient(135deg,#2563eb,#38bdf8);
             }
+            .btn[disabled] {
+              opacity:0.6;
+              cursor:not-allowed;
+            }
             input[type=range] { width:100%; accent-color:var(--accent); }
             input[type=number] {
               width:90px;
@@ -236,10 +284,26 @@
               color:white;
             }
             .status { margin-top:12px; color:var(--ink-dim);}
+            .meta {
+              margin-top:8px;
+              display:flex;
+              flex-wrap:wrap;
+              gap:8px;
+              font-size:13px;
+              color:var(--ink-dim);
+            }
+            .pill {
+              background:#10172a;
+              border:1px solid #273453;
+              padding:4px 8px;
+              border-radius:999px;
+            }
           `}</style>
 
           <h1>Reamostragem e Quantização de Áudio (.wav)</h1>
-          <div className="subtitle">Ouça como o áudio ficaria com outra frequência de amostragem e número de bits.</div>
+          <div className="subtitle">
+            Carregue um .wav e ouça como ele soaria se fosse amostrado em outra frequência (sem antialias) e com menos bits.
+          </div>
 
           <div className="panel">
 
@@ -255,30 +319,39 @@
               <div style={{ marginTop:"6px", color:"var(--ink-dim)" }}>
                 {fileName ?? "Nenhum arquivo selecionado"}
               </div>
+              {audioInfo && (
+                <div className="meta">
+                  <span className="pill">fs arquivo: {audioInfo.sampleRate.toFixed(0)} Hz</span>
+                  <span className="pill">canais: {audioInfo.channels}</span>
+                  <span className="pill">
+                    duração: {audioInfo.duration.toFixed(2)} s
+                  </span>
+                </div>
+              )}
             </div>
 
             <div className="control">
-              <label>Nova frequência de amostragem (Hz)</label>
+              <label>Frequência de amostragem do ADC (Hz, sem antialias)</label>
               <input
                 type="range"
-                min={minFs}
-                max={maxFs}
-                step="500"
+                min={minFsUi}
+                max={maxFsUi}
+                step="100"
                 value={targetFs}
                 onChange={(e)=>setTargetFs(Number(e.target.value))}
               />
               <input
                 type="number"
-                min={minFs}
-                max={maxFs}
-                step="500"
+                min={minFsUi}
+                max={maxFsUi}
+                step="100"
                 value={targetFs}
-                onChange={(e)=>setTargetFs(clamp(Number(e.target.value), minFs, maxFs))}
+                onChange={(e)=>setTargetFs(clamp(Number(e.target.value), minFsUi, maxFsUi))}
               />
             </div>
 
             <div className="control">
-              <label>Resolução (bits)</label>
+              <label>Resolução do ADC (bits)</label>
               <input
                 type="range"
                 min="2"
