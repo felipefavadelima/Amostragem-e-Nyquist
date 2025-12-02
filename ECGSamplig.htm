@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Amostragem e Nyquist com ECG</title>
+</head>
+<body style="margin:0;background:#0f1420">
+  <div id="root"></div>
+
+  <!-- React 18 e ReactDOM 18 em UMD -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- Babel para transpilar JSX no navegador -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- App -->
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState } = React
+
+    const TWO_PI = Math.PI * 2
+
+    // Malha de tempo densa de 0 a T
+    function linspaceN(n, T) {
+      const out = new Float64Array(n)
+      const dt = T / (n - 1)
+      for (let i = 0; i < n; i++) out[i] = i * dt
+      return out
+    }
+
+    // ECG emulado PQRST com batimento de 1 s
+    function ecgSignal(t) {
+      const P = 1.0
+      const x = t - Math.floor(t / P) * P
+      const gauss = (mu, sigma, amp) => amp * Math.exp(-0.5 * Math.pow((x - mu) / sigma, 2))
+      const p = gauss(0.2, 0.025, 0.1)
+      const q = gauss(0.36, 0.012, -0.15)
+      const r = gauss(0.37, 0.010, 1.0)
+      const s = gauss(0.39, 0.012, -0.25)
+      const tWave = gauss(0.6, 0.04, 0.3)
+      const baseline = 0
+      return p + q + r + s + tWave + baseline
+    }
+
+    function sampleTimes(Fs, T) {
+      if (Fs <= 0) return []
+      const N = Math.floor(T * Fs) + 1
+      const Ts = 1 / Fs
+      const times = new Float64Array(N)
+      for (let i = 0; i < N; i++) times[i] = i * Ts
+      return times
+    }
+
+    function linearInterp(tGrid, tS, yS) {
+      if (!yS || yS.length === 0) return new Float64Array(tGrid.length)
+      if (yS.length === 1) return new Float64Array(tGrid.length).fill(yS[0])
+      const Ts = tS[1] - tS[0]
+      const out = new Float64Array(tGrid.length)
+      for (let k = 0; k < tGrid.length; k++) {
+        const t = tGrid[k]
+        let idx = Math.floor(t / Ts)
+        if (idx < 0) idx = 0
+        if (idx >= yS.length - 1) idx = yS.length - 2
+        const t0 = tS[idx]
+        const t1 = tS[idx + 1]
+        const y0 = yS[idx]
+        const y1 = yS[idx + 1]
+        const w = (t - t0) / (t1 - t0)
+        out[k] = y0 + w * (y1 - y0)
+      }
+      return out
+    }
+
+    // Hook de desenho
+    function useCanvasPlot(ref, drawer) {
+      useEffect(() => {
+        function onResize() { drawer() }
+        window.addEventListener('resize', onResize)
+        drawer()
+        return () => window.removeEventListener('resize', onResize)
+      }, [drawer])
+    }
+
+    // Drawer usa T dinâmico
+    function makeDrawer(ref, data, opts) {
+      const { T, tFine, yAnalog, tS, yS, yRecon, mode, showAnalog, showSamples, showRecon } = data
+      const { colors } = opts
+      return () => {
+        const canvas = ref?.current
+        const ctx = canvas?.getContext?.('2d')
+        if (!canvas || !ctx) return
+
+        const dpr = window.devicePixelRatio || 1
+        const w = canvas.clientWidth || 600
+        const h = canvas.clientHeight || 320
+        canvas.width = Math.max(600, w * dpr)
+        canvas.height = Math.max(280, h * dpr)
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+        const W = canvas.clientWidth || 600
+        const H = canvas.clientHeight || 320
+        const left = 48
+        const right = 16
+        const top = 16
+        const bottom = 28
+
+        function xScale(t) { return left + (W - left - right) * (t / T) }
+        function yMap(y, lo, hi) { const p = (y - lo) / (hi - lo); return H - bottom - p * (H - top - bottom) }
+
+        function minMax(arrs) {
+          let lo = Infinity
+          let hi = -Infinity
+          arrs.forEach(a => {
+            if (!a) return
+            for (let i = 0; i < a.length; i++) {
+              const v = a[i]
+              if (v < lo) lo = v
+              if (v > hi) hi = v
+            }
+          })
+          if (!isFinite(lo) || !isFinite(hi)) { lo = -1; hi = 1 }
+          if (Math.abs(hi - lo) < 1e-6) { lo -= 1; hi += 1 }
+          const pad = 0.1 * (hi - lo)
+          return [lo - pad, hi + pad]
+        }
+
+        const candidates = []
+        if (showAnalog) candidates.push(yAnalog)
+        if (showSamples) candidates.push(yS)
+        if (showRecon && yRecon) candidates.push(yRecon)
+        const [yMin, yMax] = [-0.3, 1.0]
+
+        ctx.fillStyle = '#0d1322'
+        ctx.fillRect(0, 0, W, H)
+
+        ctx.strokeStyle = '#2a334a'
+        const gridN = 5
+        for (let i = 0; i < gridN; i++) {
+          const tt = (T * i) / (gridN - 1)
+          const x = xScale(tt)
+          ctx.beginPath()
+          ctx.moveTo(x, top)
+          ctx.lineTo(x, H - bottom)
+          ctx.stroke()
+          ctx.fillStyle = '#89a'
+          ctx.font = '12px sans-serif'
+          ctx.textAlign = 'center'
+          const prec = T < 1 ? 2 : 1
+          ctx.fillText(tt.toFixed(prec), x, H - 8)
+        }
+
+        const ticks = 5
+        for (let i = 0; i < ticks; i++) {
+          const y = yMin + i * (yMax - yMin) / (ticks - 1)
+          const py = yMap(y, yMin, yMax)
+          ctx.strokeStyle = '#2a334a'
+          ctx.beginPath()
+          ctx.moveTo(left, py)
+          ctx.lineTo(W - right, py)
+          ctx.stroke()
+          ctx.fillStyle = '#89a'
+          ctx.textAlign = 'right'
+          ctx.fillText(y.toFixed(2), left - 6, py + 4)
+        }
+
+        ctx.strokeStyle = '#223252'
+        ctx.strokeRect(left, top, W - left - right, H - top - bottom)
+
+        ctx.fillStyle = '#b7c2db'
+        ctx.font = '12px sans-serif'
+        ctx.save()
+        ctx.translate(12, H / 2)
+        ctx.rotate(-Math.PI / 2)
+        ctx.textAlign = 'center'
+        ctx.fillText('Amplitude', 0, 0)
+        ctx.restore()
+        ctx.textAlign = 'right'
+        ctx.fillText('tempo em s', W - 10, H - 38)
+
+        function polyline(tArr, yArr, color, width, dashed) {
+          if (!tArr || tArr.length === 0) return
+          ctx.save()
+          ctx.beginPath()
+          for (let k = 0; k < tArr.length; k++) {
+            const x = xScale(tArr[k])
+            const y = yMap(yArr[k], yMin, yMax)
+            if (k === 0) ctx.moveTo(x, y)
+            else ctx.lineTo(x, y)
+          }
+          ctx.lineWidth = width
+          ctx.strokeStyle = color
+          if (dashed) ctx.setLineDash([6, 6])
+          ctx.stroke()
+          ctx.setLineDash([])
+          ctx.restore()
+        }
+
+        function scatter(tArr, yArr, color) {
+          if (!tArr || tArr.length === 0) return
+          ctx.save()
+          ctx.fillStyle = color
+          ctx.strokeStyle = '#ffd2d2'
+          for (let i = 0; i < tArr.length; i++) {
+            const x = xScale(tArr[i])
+            const y = yMap(yArr[i], yMin, yMax)
+            ctx.beginPath()
+            ctx.arc(x, y, 4, 0, TWO_PI)
+            ctx.fill()
+            ctx.lineWidth = 1
+            ctx.stroke()
+          }
+          ctx.restore()
+        }
+
+        if (showAnalog) polyline(tFine, yAnalog, '#bfc7d9', 2, false)
+        if (showSamples && tS && tS.length) scatter(tS, yS, '#ff3b3b')
+        if (showRecon && yRecon) {
+          if (mode === 'linear') polyline(tFine, yRecon, '#2b84ff', 2, true)
+        }
+      }
+    }
+
+    function App() {
+      const [Fs, setFs] = useState(200)
+      const [mode, setMode] = useState('linear')
+      const [testMsg, setTestMsg] = useState('Rodando testes')
+
+      // Visibilidade do único gráfico
+      const [visBottom, setVisBottom] = useState({ analog: true, samples: true, recon: true })
+
+      const plotRef = useRef(null)
+
+      // Janela fixa de 1 s
+      const T = 1
+
+      // resolução da curva analógica proporcional ao tamanho da janela
+      const tFine = useMemo(() => {
+        const ptsPerSec = 2000
+        const n = Math.max(1001, Math.round(T * ptsPerSec) + 1)
+        return linspaceN(n, T)
+      }, [T])
+
+      const yAnalog = useMemo(() => {
+        const out = new Float64Array(tFine.length)
+        for (let i = 0; i < tFine.length; i++) out[i] = ecgSignal(tFine[i])
+        return out
+      }, [tFine])
+
+      const tS = useMemo(() => sampleTimes(Fs, T), [Fs, T])
+      const yS = useMemo(() => {
+        if (!tS.length) return []
+        const arr = new Float64Array(tS.length)
+        for (let i = 0; i < tS.length; i++) arr[i] = ecgSignal(tS[i])
+        return arr
+      }, [tS])
+
+      const yLinear = useMemo(() => Fs > 0 ? linearInterp(tFine, tS, yS) : null, [Fs, tFine, tS, yS])
+      const yRecon = mode === 'linear' ? yLinear : null
+
+      const colors = {
+        analog: '#bfc7d9',
+        recon: '#2b84ff',
+        reconThick: '#2b84ff',
+        point: '#ff3b3b'
+      }
+
+      const draw = useMemo(() => makeDrawer(
+        plotRef,
+        { T, tFine, yAnalog, tS, yS, yRecon, mode, showAnalog: visBottom.analog, showSamples: visBottom.samples, showRecon: visBottom.recon },
+        { colors }
+      ), [plotRef, T, tFine, yAnalog, tS, yS, yRecon, visBottom, mode])
+
+      useCanvasPlot(plotRef, draw)
+
+      function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
+
+      function resetAll() {
+        setFs(200)
+        setMode('linear')
+        setVisBottom({ analog: true, samples: true, recon: true })
+      }
+
+      // Testes automáticos simples
+      useEffect(() => {
+        try {
+          // 1) Linear passa exatamente pelos pontos
+          const FsT = 120
+          const TT = 1
+          const tST = sampleTimes(FsT, TT)
+          const yST = new Float64Array(tST.length)
+          for (let i = 0; i < tST.length; i++) yST[i] = ecgSignal(tST[i])
+          const yLinOnS = linearInterp(tST, tST, yST)
+          let maxErr = 0
+          for (let i = 0; i < yST.length; i++) maxErr = Math.max(maxErr, Math.abs(yST[i] - yLinOnS[i]))
+          console.assert(maxErr < 1e-12, 'Interp linear não está passando exatamente pelos pontos')
+
+          // 2) Estado inicial
+          console.assert(true, 'Estado inicial verificado')
+
+          setTestMsg('Testes passaram')
+        } catch (e) {
+          console.error('Falha nos testes', e)
+          setTestMsg('Falha nos testes, ver console')
+        }
+      }, [])
+
+      return (
+        <div className="wrap">
+          <style>{`
+            :root { --bg:#0f1420; --panel:#151b2a; --ink:#e8eefc; --ink-dim:#a8b2c8; --grid:#2a334a }
+            * { box-sizing: border-box }
+            body { margin:0; background:var(--bg); color:var(--ink); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell }
+            .wrap { max-width:1100px; margin:0 auto; padding:18px 14px 40px }
+            h1 { margin:4px 0 14px; font-size:20px; font-weight:700; letter-spacing:.2px; text-align:center }
+            .panel { background:var(--panel); border:1px solid #1b2235; border-radius:10px; padding:12px; box-shadow:0 6px 18px rgba(0,0,0,.25) }
+            .controls { display:grid; grid-template-columns:repeat(12,1fr); gap:10px 12px; align-items:center }
+            .control { grid-column:span 4; display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; background:#121828; border:1px solid #1b2235; border-radius:10px; padding:10px }
+            .control label { grid-column:1 / -1; font-size:13px; color:var(--ink-dim) }
+            input[type=range] { width:100%; accent-color:#4da3ff }
+            input[type=number] { width:90px; background:#0e1424; color:#e8eefc; border:1px solid #2a3859; border-radius:8px; padding:6px 8px; font-size:14px }
+            .row { margin-top:12px }
+            .radios { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; padding:12px; border-radius:10px; background:#121828; border:1px solid #1b2235 }
+            .radios label { display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:8px; background:#0e1424; border:1px solid #2a3859; font-size:14px; cursor:pointer }
+            .meta { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; padding:10px 12px; color:var(--ink-dim); font-size:14px }
+            .pill { background:#10172a; border:1px solid #273453; padding:6px 10px; border-radius:999px; display:inline-flex; gap:8px; align-items:center; color:#e8eefc }
+            .warn { border-color:#ff5e6c; color:#ffd6da; background:#2a0f15 }
+            .btn { background:linear-gradient(180deg,#3b82f6,#2563eb); color:white; border:none; border-radius:10px; padding:10px 16px; font-weight:700; cursor:pointer; box-shadow:0 5px 14px rgba(37,99,235,.35) }
+            canvas { width:100%; height:320px; display:block; background:#0d1322; border:1px solid #1b2235; border-radius:12px }
+            .plot-head { display:flex; justify-content:space-between; align-items:center; font-size:13px; color:#a8b2c8; margin:6px 2px 8px }
+            .legend { display:inline-flex; gap:12px; align-items:center }
+            .lg { display:inline-flex; gap:6px; align-items:center }
+            .swatch { width:18px; height:4px; background:#bfc7d9; border-radius:2px }
+            .dashed { border-bottom:2px dashed #2b84ff; background:transparent; height:0 }
+            .recon { background:#2b84ff; height:4px }
+            .dot { width:10px; height:10px; background:#ff3b3b; border-radius:50%; outline:2px solid #ffd2d2 }
+            .note { font-size:12px; color:#a8b2c8; margin-top:6px }
+            .toggles { display:flex; flex-wrap:wrap; gap:10px 12px; align-items:center; padding:10px 12px }
+            .toggle { display:inline-flex; gap:8px; align-items:center; background:#121828; border:1px solid #1b2235; border-radius:8px; padding:6px 10px }
+            @media (max-width:900px){ .control { grid-column:span 12 } }
+          `}</style>
+
+          <h1>Amostragem ECG</h1>
+
+          <div className="panel">
+            <div className="controls" role="group" aria-label="Controles principais">
+              <div className="control" title="Define quantas amostras por segundo são coletadas">
+                <label htmlFor="fs">Frequência de amostragem Fs em Hz</label>
+                <input id="fs" type="range" min={0} max={400} value={Fs} step={1} onChange={e => setFs(Number(e.target.value))} aria-label="Slider Fs" />
+                <input id="fsNum" type="number" min={0} max={400} step={1} value={Fs} onChange={e => setFs(clamp(Number(e.target.value), 0, 400))} aria-label="Entrada numérica Fs" />
+              </div>
+              {/* Controles de janela removidos para manter T fixo em 1 s */}
+            </div>
+
+            <div className="row meta">
+              <span className={`pill ${Fs === 0 ? '' : ''}`} title="Metade de Fs">Nyquist Fn igual a <strong>{Fs > 0 ? (Fs / 2).toFixed(1) : 'n.d.'} Hz</strong></span>
+              {Fs === 0 && (<span className="pill warn" title="Amostragem desativada">Fs igual a zero desativa amostragem</span>)}
+              <span className="pill" title="Status dos testes">{testMsg}</span>
+              <button className="btn" onClick={resetAll} title="Voltar aos padrões">Reset</button>
+            </div>
+
+            <div className="row radios" role="radiogroup" aria-label="Modo de reconstrução">
+              <label title="Somente os pontos amostrados">
+                <input type="radio" name="mode" value="none" checked={mode === 'none'} onChange={() => setMode('none')} /> Nenhum
+              </label>
+              <label title="Interpolação por segmentos de reta">
+                <input type="radio" name="mode" value="linear" checked={mode === 'linear'} onChange={() => setMode('linear')} /> Linear
+              </label>
+            </div>
+
+            <div className="toggles" aria-label="Visibilidade do gráfico">
+              <span className="pill">Camadas</span>
+              <label className="toggle"><input type="checkbox" checked={visBottom.analog} onChange={e => setVisBottom(v => ({...v, analog: e.target.checked}))} /> Analógico</label>
+              <label className="toggle"><input type="checkbox" checked={visBottom.samples} onChange={e => setVisBottom(v => ({...v, samples: e.target.checked}))} /> Amostras</label>
+              <label className="toggle"><input type="checkbox" checked={visBottom.recon} onChange={e => setVisBottom(v => ({...v, recon: e.target.checked}))} /> Reconstrução</label>
+            </div>
+
+            <div className="row">
+              <div className="plot-head">
+                <div>Reconstrução e referência com ECG</div>
+                <div className="legend">
+                  <span className="lg"><span className="swatch" style={{background:'#bfc7d9'}}></span> analógico</span>
+                  <span className="lg"><span className="dot"></span> amostras</span>
+                  <span className="lg" style={{display: mode === 'linear' ? '' : 'none'}}><span className="swatch dashed"></span> linear</span>
+                </div>
+              </div>
+              <canvas ref={plotRef} aria-label="Reconstrução e referência"></canvas>
+              <div className="note">Eixo x em segundos e eixo y em amplitude. O gráfico ajusta a escala automaticamente</div>
+            </div>
+          </div>
+        </div>
+      )
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'))
+    root.render(<App />)
+  </script>
+</body>
+</html>
+
