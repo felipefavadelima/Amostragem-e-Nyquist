@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sinal analógico e ADC – Amostragem e Quantização</title>
+  <title>Conversão AD</title>
 </head>
-<body style="margin:0;background:#0f1420">
+<body>
   <div id="root"></div>
 
   <!-- React 18 e ReactDOM 18 em UMD -->
@@ -14,12 +14,15 @@
   <!-- Babel para transpilar JSX no navegador -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  <!-- App -->
   <script type="text/babel">
     const { useState, useMemo, useRef, useEffect } = React
     const TWO_PI = Math.PI * 2
 
-    // Gera malha densa de tempo 0..T com fb pontos por segundo
+    // ======== SINAL FIXO =========
+    const F_SIG = 60           // Hz
+    const V_PEAK = 170         // Vp
+    const OFFSET = 0           // centrado em 0 V
+
     function denseTime(T, fb) {
       const n = Math.max(2, Math.round(T * fb))
       const dt = T / n
@@ -28,9 +31,8 @@
       return t
     }
 
-    // Instantes de amostragem
     function sampleTimes(fs, T) {
-      if (fs <= 0) return []
+      if (fs <= 0) return new Float64Array(0)
       const n = Math.max(1, Math.floor(T * fs))
       const dt = 1 / fs
       const t = new Float64Array(n)
@@ -38,7 +40,6 @@
       return t
     }
 
-    // Senoide com offset e amplitude
     function sineSignal(tArr, f, A, offset) {
       const y = new Float64Array(tArr.length)
       for (let i = 0; i < tArr.length; i++) {
@@ -47,7 +48,16 @@
       return y
     }
 
-    // Usa canvas e redesenha em resize
+    function lowerBound(arr, x) {
+      let lo = 0, hi = arr.length
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1
+        if (arr[mid] < x) lo = mid + 1
+        else hi = mid
+      }
+      return lo
+    }
+
     function useCanvasPlot(ref, draw) {
       useEffect(() => {
         function onResize() { draw() }
@@ -57,68 +67,277 @@
       }, [draw])
     }
 
+    // =========================
+    // Reconstrução / interpolação
+    // =========================
+
+    function reconHold(tDense, tS, yS) {
+      const y = new Float64Array(tDense.length)
+      if (tS.length === 0) return y
+      let k = 0
+      for (let i = 0; i < tDense.length; i++) {
+        const t = tDense[i]
+        while (k + 1 < tS.length && tS[k + 1] <= t) k++
+        y[i] = yS[k]
+      }
+      return y
+    }
+
+    function reconLinear(tDense, tS, yS) {
+      const y = new Float64Array(tDense.length)
+      if (tS.length === 0) return y
+      let k = 0
+      for (let i = 0; i < tDense.length; i++) {
+        const t = tDense[i]
+        while (k + 1 < tS.length && tS[k + 1] < t) k++
+        if (k + 1 >= tS.length) { y[i] = yS[tS.length - 1]; continue }
+        const t0 = tS[k], t1 = tS[k + 1]
+        const y0 = yS[k], y1 = yS[k + 1]
+        const a = (t1 === t0) ? 0 : (t - t0) / (t1 - t0)
+        y[i] = y0 + a * (y1 - y0)
+      }
+      return y
+    }
+
+    function catmullRom(p0, p1, p2, p3, u) {
+      const u2 = u*u, u3 = u2*u
+      return 0.5 * (
+        (2*p1) +
+        (-p0 + p2)*u +
+        (2*p0 - 5*p1 + 4*p2 - p3)*u2 +
+        (-p0 + 3*p1 - 3*p2 + p3)*u3
+      )
+    }
+
+    function reconSpline(tDense, tS, yS) {
+      const y = new Float64Array(tDense.length)
+      const n = tS.length
+      if (n === 0) return y
+      if (n === 1) { y.fill(yS[0]); return y }
+
+      let k = 0
+      for (let i = 0; i < tDense.length; i++) {
+        const t = tDense[i]
+        while (k + 1 < n && tS[k + 1] < t) k++
+        if (k + 1 >= n) { y[i] = yS[n - 1]; continue }
+
+        const t0 = tS[k], t1 = tS[k + 1]
+        const u = (t1 === t0) ? 0 : (t - t0) / (t1 - t0)
+
+        const i1 = k
+        const i2 = k + 1
+        const i0 = Math.max(0, i1 - 1)
+        const i3 = Math.min(n - 1, i2 + 1)
+
+        y[i] = catmullRom(yS[i0], yS[i1], yS[i2], yS[i3], u)
+      }
+      return y
+    }
+
+    function sinc(x) {
+      if (Math.abs(x) < 1e-12) return 1
+      return Math.sin(Math.PI * x) / (Math.PI * x)
+    }
+    function hann(w, M) {
+      const N = 2*M + 1
+      const n = w + M
+      return 0.5 - 0.5 * Math.cos((TWO_PI * n) / (N - 1))
+    }
+
+    function reconSincNyq(tDense, yS, fs) {
+      const y = new Float64Array(tDense.length)
+      const nS = yS.length
+      if (nS === 0) return y
+      if (nS === 1) { y.fill(yS[0]); return y }
+
+      const fc = fs / 2
+      const fcClamped = Math.max(0.01, fc)
+
+      const M = Math.max(8, Math.min(80, Math.round(fs / Math.max(5, fcClamped) * 30)))
+      const Ts = 1 / fs
+
+      for (let i = 0; i < tDense.length; i++) {
+        const t = tDense[i]
+        const kCenter = Math.round(t / Ts)
+        let acc = 0
+        let wsum = 0
+
+        const k0 = Math.max(0, kCenter - M)
+        const k1 = Math.min(nS - 1, kCenter + M)
+
+        for (let k = k0; k <= k1; k++) {
+          const tau = t - k * Ts
+          const h = 2 * fcClamped * sinc(2 * fcClamped * tau)
+          const rel = k - kCenter
+          const win = hann(rel, M)
+          const coef = h * win
+          acc += yS[k] * coef
+          wsum += coef
+        }
+        y[i] = (Math.abs(wsum) > 1e-12) ? (acc / wsum) : acc
+      }
+      return y
+    }
+
+    function aliasFreq(f, fs) {
+      if (!(fs > 0)) return NaN
+      const nyq = fs / 2
+      let r = ((f % fs) + fs) % fs
+      if (r > nyq) r = fs - r
+      return r
+    }
+
+    function almostConstantInRange(y, k0, k1, eps = 1e-9) {
+      if (!y || k1 - k0 < 2) return true
+      let min = y[k0], max = y[k0]
+      for (let k = k0 + 1; k < k1; k++) {
+        const v = y[k]
+        if (v < min) min = v
+        if (v > max) max = v
+      }
+      return (max - min) < eps
+    }
+
+    function drawAxesAndGrid(ctx, W, H, {left,right,top,bottom}, xScale, yScale, tView, yMin, yMax) {
+      const cs = getComputedStyle(document.documentElement)
+      const bg   = cs.getPropertyValue('--canvas').trim()
+      const gridV= cs.getPropertyValue('--gridV').trim()
+      const gridH= cs.getPropertyValue('--gridH').trim()
+      const frame= cs.getPropertyValue('--frame').trim()
+      const tick = cs.getPropertyValue('--tick').trim()
+
+      ctx.fillStyle = bg
+      ctx.fillRect(0, 0, W, H)
+
+      ctx.strokeStyle = gridV
+      ctx.lineWidth = 1
+      const gridN = 5
+      ctx.font = '12px system-ui, sans-serif'
+      ctx.fillStyle = tick
+
+      for (let i = 0; i < gridN; i++) {
+        const tt = (tView * i) / (gridN - 1)
+        const x = xScale(tt)
+        ctx.beginPath()
+        ctx.moveTo(x, top)
+        ctx.lineTo(x, H - bottom)
+        ctx.stroke()
+        ctx.textAlign = 'center'
+        ctx.fillText(tt.toFixed(3), x, H - 8)
+      }
+
+      const yTicks = 5
+      for (let i = 0; i < yTicks; i++) {
+        const val = yMin + (yMax - yMin) * (i / (yTicks - 1))
+        const y = yScale(val)
+        ctx.strokeStyle = gridH
+        ctx.beginPath()
+        ctx.moveTo(left, y)
+        ctx.lineTo(W - right, y)
+        ctx.stroke()
+
+        ctx.fillStyle = tick
+        ctx.textAlign = 'right'
+        ctx.fillText(val.toFixed(0), left - 6, y + 4)
+      }
+
+      ctx.strokeStyle = frame
+      ctx.strokeRect(left, top, W - left - right, H - top - bottom)
+    }
+
     function App() {
-      // Parâmetros do sinal
-      const [fSig, setFSig] = useState(1)     // Hz
-      const [amp, setAmp] = useState(2.5)    // V
-      const [offset, setOffset] = useState(2.5) // V
+      // ====== Tema ======
+      const [theme, setTheme] = useState('light')
+      // >>> AQUI: aplicar no documentElement (não no body)
+      useEffect(() => { document.documentElement.setAttribute('data-theme', theme) }, [theme])
 
-      // Duração e "frequência base" para o pseudo-contínuo
-      const [tEnd] = useState(2)            // s
-      const [fb] = useState(10000)          // Hz
+      const [T_TOTAL] = useState(1.0)
+      const [T_VIEW]  = useState(0.10)
+      const [fb] = useState(50000)
 
-      // Parâmetros de amostragem
-      const [fs, setFs] = useState(10)      // Hz
+      const tViewStart = useMemo(() => (T_TOTAL - T_VIEW) / 2, [T_TOTAL, T_VIEW])
+      const [fs, setFs] = useState(200)
 
-      // ADC
       const [nBits, setNBits] = useState(8)
-      const [vMin, setVMin] = useState(0)
-      const [vMax, setVMax] = useState(5)
+      const [vMin, setVMin] = useState(-200)
+      const [vMax, setVMax] = useState(200)
+
+      const [interp, setInterp] = useState('none')
+
+      const [showOriginal, setShowOriginal] = useState(true)
+      const [showPoints, setShowPoints] = useState(true)
+      const [showRecon, setShowRecon] = useState(true)
 
       const canvasRef = useRef(null)
 
-      // Tempo denso e amostrado
-      const tDense = useMemo(() => denseTime(tEnd, fb), [tEnd, fb])
-      const tSamples = useMemo(() => sampleTimes(fs, tEnd), [fs, tEnd])
+      const tDense   = useMemo(() => denseTime(T_TOTAL, fb), [T_TOTAL, fb])
+      const tSamples = useMemo(() => sampleTimes(fs, T_TOTAL), [fs, T_TOTAL])
 
-      // Sinal analógico contínuo e amostrado
-      const yDense = useMemo(
-        () => sineSignal(tDense, fSig, amp, offset),
-        [tDense, fSig, amp, offset]
-      )
+      const yDense = useMemo(() => sineSignal(tDense, F_SIG, V_PEAK, OFFSET), [tDense])
+      const ySamples = useMemo(() => sineSignal(tSamples, F_SIG, V_PEAK, OFFSET), [tSamples])
 
-      const ySamples = useMemo(
-        () => sineSignal(tSamples, fSig, amp, offset),
-        [tSamples, fSig, amp, offset]
-      )
-
-      // ADC: níveis, LSB, clipping, códigos
       const adcInfo = useMemo(() => {
         const Nlevels = Math.pow(2, Math.max(1, nBits))
-        const span = vMax - vMin || 1
+        const span = (vMax - vMin) || 1
         const LSB = span / (Nlevels - 1)
 
-        const yClip = new Float64Array(ySamples.length)
         const codes = new Uint32Array(ySamples.length)
         const yQuant = new Float64Array(ySamples.length)
 
         for (let i = 0; i < ySamples.length; i++) {
           const val = ySamples[i]
           const clipped = Math.min(Math.max(val, vMin), vMax)
-          yClip[i] = clipped
           let code = Math.round((clipped - vMin) / LSB)
           if (code < 0) code = 0
           if (code > Nlevels - 1) code = Nlevels - 1
           codes[i] = code
           yQuant[i] = vMin + code * LSB
         }
-
-        return { Nlevels, LSB, yClip, codes, yQuant }
+        return { Nlevels, LSB, codes, yQuant }
       }, [ySamples, vMin, vMax, nBits])
 
-      const { Nlevels, LSB, yClip, codes, yQuant } = adcInfo
+      const { Nlevels, LSB, codes, yQuant } = adcInfo
+      const nyq = fs / 2
 
-      // Linhas da tabela (primeiras 50 amostras)
+      const yRecon = useMemo(() => {
+        if (tSamples.length === 0) return null
+        if (interp === 'none') return null
+        if (interp === 'hold') return reconHold(tDense, tSamples, yQuant)
+        if (interp === 'linear') return reconLinear(tDense, tSamples, yQuant)
+        if (interp === 'spline') return reconSpline(tDense, tSamples, yQuant)
+        return reconSincNyq(tDense, yQuant, fs)
+      }, [interp, tDense, tSamples, yQuant, fs])
+
+      const viewIdx = useMemo(() => {
+        const i0 = lowerBound(tDense, tViewStart)
+        const i1 = lowerBound(tDense, tViewStart + T_VIEW)
+        const k0 = lowerBound(tSamples, tViewStart)
+        const k1 = lowerBound(tSamples, tViewStart + T_VIEW)
+        return { i0, i1, k0, k1 }
+      }, [tDense, tSamples, tViewStart, T_VIEW])
+
+      const { i0, i1, k0, k1 } = viewIdx
+
+      const mse = useMemo(() => {
+        if (!yRecon) return NaN
+        const n = Math.max(0, i1 - i0)
+        if (n === 0) return NaN
+        let acc = 0
+        for (let i = i0; i < i1; i++) {
+          const e = yDense[i] - yRecon[i]
+          acc += e * e
+        }
+        return acc / n
+      }, [i0, i1, yDense, yRecon])
+
+      const fReconShown = useMemo(() => {
+        if (interp !== 'sinc') return NaN
+        if (k1 - k0 < 2) return NaN
+        const isConst = almostConstantInRange(yQuant, k0, k1, 1e-9)
+        if (isConst) return 0
+        return aliasFreq(F_SIG, fs)
+      }, [interp, fs, yQuant, k0, k1])
+
       const sampleRows = useMemo(() => {
         const maxRows = Math.min(50, tSamples.length)
         const rows = []
@@ -127,15 +346,16 @@
           const bin = code.toString(2).padStart(Math.max(1, nBits), '0')
           rows.push({
             idx: i,
+            t: tSamples[i],
             analog: ySamples[i],
+            quant: yQuant[i],
             codeDec: code,
             codeBin: bin
           })
         }
         return rows
-      }, [tSamples.length, ySamples, codes, nBits])
+      }, [tSamples, ySamples, yQuant, codes, nBits])
 
-      // Desenho no canvas
       const draw = useMemo(() => {
         return () => {
           const canvas = canvasRef.current
@@ -144,142 +364,73 @@
           if (!ctx) return
 
           const dpr = window.devicePixelRatio || 1
-          const cw = canvas.clientWidth || 800
-          const ch = canvas.clientHeight || 340
+          const cw = canvas.clientWidth || 900
+          const ch = canvas.clientHeight || 360
           canvas.width = cw * dpr
           canvas.height = ch * dpr
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-          const W = cw
-          const H = ch
-          const left = 56
-          const right = 56
-          const top = 20
-          const bottom = 36
+          const W = cw, H = ch
+          const left = 56, right = 56, top = 24, bottom = 36
+          const yMin = -200
+          const yMax =  200
 
-          ctx.fillStyle = '#0d1322'
-          ctx.fillRect(0, 0, W, H)
-
-          // Eixos em função do range do ADC
-          const range = (vMax - vMin) || 1
-          const yMin = vMin - 0.1 * range
-          const yMax = vMax + 0.1 * range
-
-          function xScale(t) {
-            return left + (W - left - right) * (t / tEnd)
-          }
-          function yScale(v) {
+          const xScale = tau => left + (W - left - right) * (tau / T_VIEW)
+          const yScale = v => {
             const p = (v - yMin) / (yMax - yMin)
             return H - bottom - p * (H - top - bottom)
           }
 
-          // Grade vertical (tempo)
-          ctx.strokeStyle = '#2a334a'
-          ctx.lineWidth = 1
-          const gridN = 5
-          ctx.font = '12px system-ui, sans-serif'
-          ctx.fillStyle = '#8fa0c2'
+          drawAxesAndGrid(ctx, W, H, {left,right,top,bottom}, xScale, yScale, T_VIEW, yMin, yMax)
 
-          for (let i = 0; i < gridN; i++) {
-            const tt = (tEnd * i) / (gridN - 1)
-            const x = xScale(tt)
-            ctx.beginPath()
-            ctx.moveTo(x, top)
-            ctx.lineTo(x, H - bottom)
-            ctx.stroke()
-            ctx.textAlign = 'center'
-            ctx.fillText(tt.toFixed(2), x, H - 8)
-          }
-
-          // Grade horizontal (volts)
-          const yTicks = 5
-          for (let i = 0; i < yTicks; i++) {
-            const val = yMin + (yMax - yMin) * (i / (yTicks - 1))
-            const y = yScale(val)
-            ctx.strokeStyle = '#1f293b'
-            ctx.beginPath()
-            ctx.moveTo(left, y)
-            ctx.lineTo(W - right, y)
-            ctx.stroke()
-
-            ctx.fillStyle = '#8fa0c2'
-            ctx.textAlign = 'right'
-            ctx.fillText(val.toFixed(2), left - 6, y + 4)
-          }
-
-          // Moldura do gráfico
-          ctx.strokeStyle = '#223252'
-          ctx.strokeRect(left, top, W - left - right, H - top - bottom)
+          const cs = getComputedStyle(document.documentElement)
+          const ink = cs.getPropertyValue('--ink').trim()
+          const originalStroke = cs.getPropertyValue('--orig').trim()
+          const reconStroke = cs.getPropertyValue('--recon').trim()
+          const dotFill = cs.getPropertyValue('--dot').trim()
+          const dotStroke = cs.getPropertyValue('--dotStroke').trim()
+          const adcLine = cs.getPropertyValue('--adcLine').trim()
 
           // Eixo Y direito – códigos digitais
           const nTicksDigital = Math.min(Nlevels, 5)
-          const yt = []
+          const vals = []
           for (let i = 0; i < nTicksDigital; i++) {
-            const v = vMin + (vMax - vMin) * (i / (nTicksDigital - 1 || 1))
-            yt.push(v)
+            vals.push(vMin + (vMax - vMin) * (i / (nTicksDigital - 1 || 1)))
           }
-          ctx.fillStyle = '#c6d0f5'
+          ctx.fillStyle = ink
           ctx.textAlign = 'left'
-          yt.forEach(v => {
+          vals.forEach(v => {
             const y = yScale(v)
             const code = Math.round((v - vMin) / (LSB || 1))
             const clamped = Math.max(0, Math.min(code, Nlevels - 1))
             ctx.fillText(clamped.toString(), W - right + 6, y + 4)
           })
 
-          // Rótulos dos eixos
+          // Labels
           ctx.save()
-          ctx.fillStyle = '#c6d0f5'
+          ctx.fillStyle = ink
           ctx.font = '13px system-ui, sans-serif'
-          // Y esquerdo (Volts)
           ctx.translate(16, H / 2)
           ctx.rotate(-Math.PI / 2)
           ctx.textAlign = 'center'
-          ctx.fillText('Tensão analógica (V)', 0, 0)
+          ctx.fillText('Tensão (V)', 0, 0)
           ctx.restore()
 
-          // Y direito (código)
           ctx.save()
           ctx.translate(W - 16, H / 2)
           ctx.rotate(-Math.PI / 2)
           ctx.textAlign = 'center'
-          ctx.fillText('Código digital do ADC', 0, 0)
+          ctx.fillStyle = ink
+          ctx.fillText('Código do ADC', 0, 0)
           ctx.restore()
 
-          // X (tempo)
-          ctx.fillStyle = '#c6d0f5'
+          ctx.fillStyle = ink
           ctx.textAlign = 'right'
           ctx.fillText('Tempo (s)', W - 10, H - 40)
 
-          // Sinal contínuo
-          ctx.strokeStyle = '#bfc7d9'
-          ctx.lineWidth = 2
-          ctx.beginPath()
-          for (let i = 0; i < tDense.length; i++) {
-            const x = xScale(tDense[i])
-            const y = yScale(yDense[i])
-            if (i === 0) ctx.moveTo(x, y)
-            else ctx.lineTo(x, y)
-          }
-          ctx.stroke()
-
-          // Pontos amostrados (valor quantizado em volts)
-		ctx.fillStyle = '#ff3b3b'
-		ctx.strokeStyle = '#ffd2d2'
-		for (let i = 0; i < tSamples.length; i++) {
-		  const x = xScale(tSamples[i])
-		  const y = yScale(yQuant[i])   // <-- agora usa o valor quantizado
-		  ctx.beginPath()
-		  ctx.arc(x, y, 4, 0, TWO_PI)
-		  ctx.fill()
-		  ctx.lineWidth = 1
-		  ctx.stroke()
-}
-
-
-          // Linha marcando Vmin e Vmax
+          // Linhas Vmin/Vmax do ADC
           ctx.setLineDash([6, 4])
-          ctx.strokeStyle = '#3b82f6'
+          ctx.strokeStyle = adcLine
           ;[vMin, vMax].forEach(v => {
             const y = yScale(v)
             ctx.beginPath()
@@ -288,8 +439,58 @@
             ctx.stroke()
           })
           ctx.setLineDash([])
+
+          if (showOriginal) {
+            ctx.strokeStyle = originalStroke
+            ctx.lineWidth = 2
+            ctx.beginPath()
+            for (let i = i0; i < i1; i++) {
+              const tau = tDense[i] - tViewStart
+              const x = xScale(tau)
+              const y = yScale(yDense[i])
+              if (i === i0) ctx.moveTo(x, y)
+              else ctx.lineTo(x, y)
+            }
+            ctx.stroke()
+          }
+
+          const canRecon = (yRecon && interp !== 'none')
+          if (showRecon && canRecon) {
+            ctx.strokeStyle = reconStroke
+            ctx.lineWidth = 2
+            ctx.beginPath()
+            for (let i = i0; i < i1; i++) {
+              const tau = tDense[i] - tViewStart
+              const x = xScale(tau)
+              const y = yScale(yRecon[i])
+              if (i === i0) ctx.moveTo(x, y)
+              else ctx.lineTo(x, y)
+            }
+            ctx.stroke()
+          }
+
+          if (showPoints) {
+            ctx.fillStyle = dotFill
+            ctx.strokeStyle = dotStroke
+            for (let k = k0; k < k1; k++) {
+              const tau = tSamples[k] - tViewStart
+              const x = xScale(tau)
+              const y = yScale(yQuant[k])
+              ctx.beginPath()
+              ctx.arc(x, y, 4, 0, TWO_PI)
+              ctx.fill()
+              ctx.lineWidth = 1
+              ctx.stroke()
+            }
+          }
         }
-      }, [tDense, yDense, tSamples, yClip, vMin, vMax, tEnd, Nlevels, LSB])
+      }, [
+        tDense, yDense, tSamples, yQuant, yRecon,
+        vMin, vMax, T_VIEW, tViewStart, i0, i1, k0, k1,
+        Nlevels, LSB,
+        showOriginal, showPoints, showRecon, interp,
+        theme
+      ])
 
       useCanvasPlot(canvasRef, draw)
 
@@ -299,307 +500,318 @@
       }
 
       const span = vMax - vMin
-      const lsbText = span > 0 ? LSB.toFixed(4) : '—'
+      const lsbText = span > 0 ? LSB.toFixed(3) : '—'
+      const mseEnabled = (interp !== 'none' && showRecon)
+      const fEnabled   = (interp === 'sinc' && showRecon)
 
       return (
         <div className="wrap">
           <style>{`
             :root {
+              /* ===== DARK (padrão) ===== */
               --bg:#0f1420;
               --panel:#151b2a;
+              --panel2:#121828;
               --ink:#e8eefc;
               --ink-dim:#a8b2c8;
+              --border:#1b2235;
+              --input:#0e1424;
+              --inputBorder:#2a3859;
+
+              /* Canvas (dark) */
+              --canvas:#0d1322;
+              --gridV:#2a334a;
+              --gridH:#1f293b;
+              --frame:#223252;
+              --tick:#8fa0c2;
+
+              --orig:#bfc7d9;
+              --recon:#9ad5ff;
+              --dot:#ff3b3b;
+              --dotStroke:#ffd2d2;
+              --adcLine:#3b82f6;
             }
+
+            /* >>> AQUI: light aplicado no :root */
+            :root[data-theme="light"] {
+              --bg:#f6f7fb;
+              --panel:#ffffff;
+              --panel2:#f1f3f8;
+              --ink:#0f172a;
+              --ink-dim:#475569;
+              --border:#d8dee9;
+              --input:#ffffff;
+              --inputBorder:#cbd5e1;
+
+              --canvas:#ffffff;
+              --gridV:#d1d5db;
+              --gridH:#e5e7eb;
+              --frame:#94a3b8;
+              --tick:#334155;
+
+              --orig:#0f172a;
+              --recon:#2563eb;
+              --dot:#dc2626;
+              --dotStroke:#fecaca;
+              --adcLine:#2563eb;
+            }
+
             * { box-sizing:border-box; }
-            body { margin:0; background:var(--bg); color:var(--ink);
-                   font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto; }
+            body {
+              margin:0;
+              background:var(--bg);
+              color:var(--ink);
+              font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto;
+            }
+
             .wrap { max-width:1100px; margin:0 auto; padding:18px 14px 40px; }
-            h1 { margin:4px 0 14px; font-size:20px; font-weight:700;
-                 letter-spacing:.2px; text-align:center; }
+            h1 { margin:4px 0 10px; font-size:20px; font-weight:700; letter-spacing:.2px; text-align:center; }
+            .sub { text-align:center; color:var(--ink-dim); margin:0 0 14px; font-size:13px; }
+
             .panel {
               background:var(--panel);
-              border:1px solid #1b2235;
+              border:1px solid var(--border);
               border-radius:10px;
               padding:12px;
-              box-shadow:0 6px 18px rgba(0,0,0,.25);
+              box-shadow:0 6px 18px rgba(0,0,0,.12);
             }
+
             .controls {
               display:grid;
               grid-template-columns:repeat(12,1fr);
               gap:10px 12px;
               align-items:center;
             }
+
             .control {
               grid-column:span 4;
               display:grid;
               grid-template-columns:1fr auto;
               gap:8px;
               align-items:center;
-              background:#121828;
-              border:1px solid #1b2235;
+              background:var(--panel2);
+              border:1px solid var(--border);
               border-radius:10px;
               padding:10px;
             }
-            .control label {
-              grid-column:1 / -1;
-              font-size:13px;
-              color:var(--ink-dim);
-            }
-            input[type=range] {
-              width:100%;
-              accent-color:#4da3ff;
-            }
-            input[type=number] {
-              width:90px;
-              background:#0e1424;
-              color:#e8eefc;
-              border:1px solid #2a3859;
+
+            .control label { grid-column:1 / -1; font-size:13px; color:var(--ink-dim); }
+            input[type=range] { width:100%; accent-color:#4da3ff; }
+
+            input[type=number], select {
+              width:120px;
+              background:var(--input);
+              color:var(--ink);
+              border:1px solid var(--inputBorder);
               border-radius:8px;
               padding:6px 8px;
               font-size:14px;
             }
-            .row { margin-top:12px; }
+
+            select { width:220px; }
+            .toggle {
+              display:flex;
+              align-items:center;
+              justify-content:space-between;
+              width:220px;
+              padding:8px 10px;
+              border-radius:10px;
+              border:1px solid var(--border);
+              background:var(--panel2);
+              color:var(--ink-dim);
+              font-size:13px;
+              gap:10px;
+            }
+
+            .toggle input { transform: scale(1.15); }
+            .toggles3 { display:grid; grid-template-columns:1fr; gap:8px; width:100%; }
+
             canvas {
               width:100%;
-              height:340px;
+              height:360px;
               display:block;
-              background:#0d1322;
+              background:var(--canvas);
               border-radius:12px;
-              border:1px solid #1b2235;
+              border:1px solid var(--border);
             }
+
             .meta {
               display:flex;
               flex-wrap:wrap;
               gap:10px 12px;
-              margin-top:8px;
+              margin-top:10px;
               font-size:13px;
               color:var(--ink-dim);
             }
+
             .pill {
-              background:#10172a;
-              border:1px solid #273453;
+              background:var(--panel2);
+              border:1px solid var(--border);
               padding:6px 10px;
               border-radius:999px;
               display:inline-flex;
               gap:6px;
               align-items:center;
             }
+
+            .pill-strong {
+              background:var(--panel2);
+              border:1px solid var(--adcLine);
+              padding:8px 14px;
+              border-radius:999px;
+              display:inline-flex;
+              gap:8px;
+              align-items:center;
+              font-size:14px;
+              color:var(--ink);
+              box-shadow:0 6px 18px rgba(37,99,235,.10);
+            }
+
+            .pill-strong strong { font-size:16px; letter-spacing:.2px; }
+
             .legend {
               display:flex;
               gap:12px;
               align-items:center;
               font-size:13px;
               color:var(--ink-dim);
-              margin:6px 2px 8px;
+              margin:8px 2px 8px;
               justify-content:space-between;
+              flex-wrap:wrap;
             }
+
             .lg { display:inline-flex; gap:6px; align-items:center; }
-            .swatch { width:18px; height:4px; background:#bfc7d9; border-radius:2px; }
-            .dot { width:10px; height:10px; background:#ff3b3b; border-radius:50%; outline:2px solid #ffd2d2; }
-            .range-line { width:18px; height:0; border-bottom:2px dashed #3b82f6; }
-            .note { font-size:12px; color:#a8b2c8; margin-top:4px; }
+            .swatch { width:18px; height:4px; background:var(--orig); border-radius:2px; }
+            .swatch2 { width:18px; height:4px; background:var(--recon); border-radius:2px; }
+            .dot { width:10px; height:10px; background:var(--dot); border-radius:50%; outline:2px solid var(--dotStroke); }
+            .range-line { width:18px; height:0; border-bottom:2px dashed var(--adcLine); }
+
+            .note { font-size:12px; color:var(--ink-dim); margin-top:6px; line-height:1.3; }
+
             .table-wrap {
               margin-top:18px;
-              background:#121828;
+              background:var(--panel2);
               border-radius:10px;
-              border:1px solid #1b2235;
+              border:1px solid var(--border);
               padding:10px 12px 14px;
             }
-            .table-wrap h2 {
-              margin:4px 0 10px;
-              font-size:16px;
-              font-weight:600;
-            }
-            table {
-              width:100%;
-              border-collapse:collapse;
-              font-size:13px;
-            }
+
+            .table-wrap h2 { margin:4px 0 10px; font-size:16px; font-weight:600; color:var(--ink); }
+            table { width:100%; border-collapse:collapse; font-size:13px; }
             th, td {
               padding:6px 8px;
               text-align:right;
-              border-bottom:1px solid #1f2937;
+              border-bottom:1px solid var(--border);
               white-space:nowrap;
+              color:var(--ink);
             }
-            th:first-child, td:first-child {
-              text-align:center;
-            }
-            th {
-              background:#182032;
-              color:#e5e7eb;
-              position:sticky;
-              top:0;
-              z-index:1;
-            }
-            tbody tr:nth-child(odd) {
-              background:#101624;
-            }
-            tbody tr:nth-child(even) {
-              background:#0d1320;
-            }
-            .table-scroll {
-              max-height:260px;
-              overflow:auto;
-              border-radius:8px;
-              border:1px solid #1f2937;
-            }
-            @media(max-width:900px) {
-              .control { grid-column:span 12; }
-            }
+            th:first-child, td:first-child { text-align:center; }
+            th { background:var(--panel); position:sticky; top:0; z-index:1; }
+            tbody tr:nth-child(odd) { background:rgba(0,0,0,.02); }
+            .table-scroll { max-height:260px; overflow:auto; border-radius:8px; border:1px solid var(--border); }
+
+            .footer-theme { margin-top:14px; display:flex; justify-content:flex-end; }
+
+            @media(max-width:900px) { .control { grid-column:span 12; } }
           `}</style>
 
-          <h1>Sinal senoidal, amostragem e conversão ADC</h1>
+          <h1>Conversão AD</h1>
+          <p className="sub">
+            O sinal analógico original é uma senoide de 60 Hz com valor de pico de 170 V.
+          </p>
 
           <div className="panel">
             <div className="controls">
               <div className="control">
-                <label htmlFor="fSig">f sinal (Hz)</label>
-                <input
-                  id="fSig"
-                  type="range"
-                  min="0.1" max="20" step="0.1"
-                  value={fSig}
-                  onChange={e => setFSig(Number(e.target.value))}
-                />
-                <input
-                  type="number"
-                  min="0.1" max="100" step="0.1"
-                  value={fSig}
-                  onChange={e => setFSig(clamp(Number(e.target.value), 0.1, 100))}
-                />
-              </div>
-
-              <div className="control">
-                <label htmlFor="amp">Amplitude (V)</label>
-                <input
-                  id="amp"
-                  type="range"
-                  min="0" max="5" step="0.1"
-                  value={amp}
-                  onChange={e => setAmp(Number(e.target.value))}
-                />
-                <input
-                  type="number"
-                  min="0" max="20" step="0.1"
-                  value={amp}
-                  onChange={e => setAmp(clamp(Number(e.target.value), 0, 20))}
-                />
-              </div>
-
-              <div className="control">
-                <label htmlFor="offset">Offset (V)</label>
-                <input
-                  id="offset"
-                  type="range"
-                  min="-2.5" max="7.5" step="0.1"
-                  value={offset}
-                  onChange={e => setOffset(Number(e.target.value))}
-                />
-                <input
-                  type="number"
-                  min="-10" max="10" step="0.1"
-                  value={offset}
-                  onChange={e => setOffset(clamp(Number(e.target.value), -10, 10))}
-                />
-              </div>
-
-              <div className="control">
                 <label htmlFor="fs">f amostragem (Hz)</label>
-                <input
-                  id="fs"
-                  type="range"
-                  min="1" max="200" step="1"
-                  value={fs}
-                  onChange={e => setFs(Number(e.target.value))}
-                />
-                <input
-                  type="number"
-                  min="1" max="1000" step="1"
-                  value={fs}
-                  onChange={e => setFs(clamp(Number(e.target.value), 1, 1000))}
-                />
+                <input id="fs" type="range" min="10" max="1000" step="1" value={fs}
+                  onChange={e => setFs(Number(e.target.value))}/>
+                <input type="number" min="10" max="1000" step="1" value={fs}
+                  onChange={e => setFs(clamp(Number(e.target.value), 10, 1000))}/>
               </div>
 
               <div className="control">
                 <label htmlFor="vmin">Vmin ADC (V)</label>
-                <input
-                  id="vmin"
-                  type="range"
-                  min="-5" max="5" step="0.1"
-                  value={vMin}
-                  onChange={e => setVMin(Number(e.target.value))}
-                />
-                <input
-                  type="number"
-                  min="-20" max="20" step="0.1"
-                  value={vMin}
-                  onChange={e => setVMin(Number(e.target.value))}
-                />
+                <input id="vmin" type="range" min="-400" max="0" step="1" value={vMin}
+                  onChange={e => setVMin(Number(e.target.value))}/>
+                <input type="number" min="-1000" max="1000" step="1" value={vMin}
+                  onChange={e => setVMin(Number(e.target.value))}/>
               </div>
 
               <div className="control">
                 <label htmlFor="vmax">Vmax ADC (V)</label>
-                <input
-                  id="vmax"
-                  type="range"
-                  min="0" max="10" step="0.1"
-                  value={vMax}
-                  onChange={e => setVMax(Number(e.target.value))}
-                />
-                <input
-                  type="number"
-                  min="-20" max="20" step="0.1"
-                  value={vMax}
-                  onChange={e => setVMax(Number(e.target.value))}
-                />
+                <input id="vmax" type="range" min="0" max="400" step="1" value={vMax}
+                  onChange={e => setVMax(Number(e.target.value))}/>
+                <input type="number" min="-1000" max="1000" step="1" value={vMax}
+                  onChange={e => setVMax(Number(e.target.value))}/>
               </div>
 
               <div className="control">
                 <label htmlFor="nbits">N bits do ADC</label>
-                <input
-                  id="nbits"
-                  type="range"
-                  min="1" max="16" step="1"
-                  value={nBits}
-                  onChange={e => setNBits(Number(e.target.value))}
-                />
-                <input
-                  type="number"
-                  min="1" max="24" step="1"
-                  value={nBits}
-                  onChange={e => setNBits(clamp(Number(e.target.value), 1, 24))}
-                />
+                <input id="nbits" type="range" min="1" max="16" step="1" value={nBits}
+                  onChange={e => setNBits(Number(e.target.value))}/>
+                <input type="number" min="1" max="24" step="1" value={nBits}
+                  onChange={e => setNBits(clamp(Number(e.target.value), 1, 24))}/>
+              </div>
+
+              <div className="control">
+                <label htmlFor="interp">Reconstrução / interpolação</label>
+                <select id="interp" value={interp} onChange={e => setInterp(e.target.value)}>
+                  <option value="none">Nenhuma</option>
+                  <option value="hold">ZOH</option>
+                  <option value="linear">Linear</option>
+                  <option value="spline">Spline</option>
+                  <option value="sinc">Sinc passa-baixas ideal</option>
+                </select>
+                <div style={{width:120}} />
+              </div>
+
+              <div className="control" style={{padding:10}}>
+                <label>Exibir no gráfico</label>
+                <div className="toggles3">
+                  <div className="toggle"><span>Original</span>
+                    <input type="checkbox" checked={showOriginal} onChange={e => setShowOriginal(e.target.checked)} />
+                  </div>
+                  <div className="toggle"><span>Amostras</span>
+                    <input type="checkbox" checked={showPoints} onChange={e => setShowPoints(e.target.checked)} />
+                  </div>
+                  <div className="toggle"><span>Reconstrução</span>
+                    <input type="checkbox" checked={showRecon} onChange={e => setShowRecon(e.target.checked)} disabled={interp === 'none'} />
+                  </div>
+                </div>
               </div>
             </div>
 
             <div className="meta">
-              <span className="pill">
-                <strong>{nBits}</strong> bits → {Nlevels} níveis
+              <span className="pill"><strong>{nBits}</strong> bits → {Math.pow(2, Math.max(1, nBits))} níveis</span>
+              <span className="pill">LSB ≈ <strong>{(vMax - vMin) > 0 ? LSB.toFixed(3) : '—'}</strong> V</span>
+              <span className="pill">V ADC = [{vMin.toFixed(0)}, {vMax.toFixed(0)}] V</span>
+              <span className="pill">fs = {fs.toFixed(0)} Hz (Nyquist = {nyq.toFixed(0)} Hz)</span>
+
+              <span className="pill-strong" style={{marginLeft:'auto'}}>
+                MSE: <strong>{(interp !== 'none' && showRecon && Number.isFinite(mse)) ? mse.toFixed(2) : '—'}</strong> V²
               </span>
-              <span className="pill">
-                LSB ≈ <strong>{lsbText}</strong> V
-              </span>
-              <span className="pill">
-                V ADC = [{vMin.toFixed(2)}, {vMax.toFixed(2)}] V
-              </span>
-              <span className="pill">
-                f sinal = {fSig.toFixed(2)} Hz, f amostragem = {fs.toFixed(1)} Hz
+
+              <span className="pill-strong">
+                f(recon): <strong>{(interp === 'sinc' && showRecon && Number.isFinite(fReconShown)) ? fReconShown.toFixed(2) : '—'}</strong> Hz
               </span>
             </div>
 
             <div className="legend">
               <div>
-                <span className="lg"><span className="swatch"></span> sinal analógico</span>
-                <span className="lg"><span className="dot"></span> amostras (saturadas)</span>
-                <span className="lg"><span className="range-line"></span> Vmin / Vmax do ADC</span>
+                <span className="lg"><span className="swatch"></span> Original    </span>
+                <span className="lg"><span className="dot"></span> Amostras     </span>
+                <span className="lg"><span className="range-line"></span> ADC Vmin / Vmax    </span>
+                <span className="lg"><span className="swatch2"></span>Reconstrução</span>
               </div>
             </div>
 
-            <canvas ref={canvasRef} aria-label="Sinal analógico e pontos digitalizados"></canvas>
+            <canvas ref={canvasRef} aria-label="Sinal original, amostras e reconstrução sobreposta"></canvas>
+
             <div className="note">
-              Eixo Y esquerdo em volts; eixo Y direito mostra o código digital correspondente
-              para os mesmos níveis de tensão. Quando o sinal excede [{vMin.toFixed(2)}, {vMax.toFixed(2)}] V,
-              ele é saturado antes da quantização.
+              f(recon) só aparece para <strong>Sinc</strong>. Se as amostras na janela ficarem (quase) constantes
+              (ex.: fs = 120 Hz com sinal de 60 Hz → amostragem sempre em cruzamento de zero), mostramos <strong>0 Hz</strong>.
+              Caso contrário, usamos o rebatimento por Nyquist.
             </div>
 
             <div className="table-wrap">
@@ -608,17 +820,16 @@
                 <table>
                   <thead>
                     <tr>
-                      <th>#</th>
-                      <th>Analógico (V)</th>
-                      <th>Código decimal</th>
-                      <th>Código binário</th>
+                      <th>#</th><th>t (s)</th><th>Analógico (V)</th><th>Quantizado (V)</th><th>Código decimal</th><th>Código binário</th>
                     </tr>
                   </thead>
                   <tbody>
                     {sampleRows.map(row => (
                       <tr key={row.idx}>
                         <td>{row.idx}</td>
-                        <td>{row.analog.toFixed(4)}</td>
+                        <td>{row.t.toFixed(6)}</td>
+                        <td>{row.analog.toFixed(2)}</td>
+                        <td>{row.quant.toFixed(2)}</td>
                         <td>{row.codeDec}</td>
                         <td>{row.codeBin}</td>
                       </tr>
@@ -626,8 +837,16 @@
                   </tbody>
                 </table>
               </div>
-              <div className="note">
-                Valores analógicos mostrados antes do clipping; códigos digitais calculados após saturação e quantização.
+
+              <div className="footer-theme">
+                <div className="control" style={{maxWidth:360}}>
+                  <label htmlFor="theme">Estilo de cores</label>
+                  <select id="theme" value={theme} onChange={e => setTheme(e.target.value)}>
+		    <option value="light">Light</option>
+                    <option value="dark">Dark</option>
+                  </select>
+                  <div style={{width:120}} />
+                </div>
               </div>
             </div>
           </div>
