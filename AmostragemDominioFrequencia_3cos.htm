@@ -121,10 +121,10 @@
         const y0 = H - pad.b
         ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y0+5); ctx.stroke()
         const txt =
-          (Math.abs(xv) < 1e-12) ? '0'
-          : (Math.abs(xv) < 1 ? xv.toFixed(4)
-          : (Math.abs(xv) < 10 ? xv.toFixed(3)
-          : (Math.abs(xv) < 100 ? xv.toFixed(2) : xv.toFixed(0))))
+          (Math.abs(xv) < 1e-12) ? '0' :
+          (Math.abs(xv) < 1 ? xv.toFixed(4) :
+          (Math.abs(xv) < 10 ? xv.toFixed(3) :
+          (Math.abs(xv) < 100 ? xv.toFixed(2) : xv.toFixed(0))))
         ctx.fillText(txt, x, y0+7)
       }
 
@@ -138,9 +138,9 @@
         const x0 = pad.l
         ctx.beginPath(); ctx.moveTo(x0-5, y); ctx.lineTo(x0, y); ctx.stroke()
         const txt =
-          (Math.abs(yv) < 1e-12) ? '0'
-          : (Math.abs(yv) < 1 ? yv.toFixed(3)
-          : (Math.abs(yv) < 10 ? yv.toFixed(2) : yv.toFixed(1)))
+          (Math.abs(yv) < 1e-12) ? '0' :
+          (Math.abs(yv) < 1 ? yv.toFixed(3) :
+          (Math.abs(yv) < 10 ? yv.toFixed(2) : yv.toFixed(1)))
         ctx.fillText(txt, x0-7, y)
       }
     }
@@ -218,10 +218,10 @@
     // DSP helpers
     // =====================
     function wrapToNyquist(f, Fs) {
-      // mapeia f para intervalo [-Fs/2, Fs/2)
+      // [-Fs/2, Fs/2)
       const half = Fs/2
       let x = ((f + half) % Fs + Fs) % Fs // [0, Fs)
-      return x - half // [-Fs/2, Fs/2)
+      return x - half
     }
 
     // =====================
@@ -290,7 +290,7 @@
         document.documentElement.setAttribute('data-theme', theme)
       }, [theme])
 
-      // Três cossenoides fixas (amplitude 1.0 cada quando ligadas)
+      // 3 cossenoides (amplitude 1.0 cada)
       const [on480, setOn480]   = useState(true)
       const [on720, setOn720]   = useState(false)
       const [on1200, setOn1200] = useState(false)
@@ -306,7 +306,7 @@
       const [fs, setFs] = useState(4000) // 200..12000
       const fc = useMemo(() => fs/2, [fs])
 
-      // janela visual (tempo) — curta para ver altas frequências
+      // visualização no tempo
       const Tview = 0.010 // 10 ms
       const Ncont = 1200
       const pad = { l: 64, r: 18, t: 18, b: 44 }
@@ -320,127 +320,150 @@
       const [showReconInModal, setShowReconInModal] = useState(true)
 
       // =====================
-      // ÁUDIO (Web Audio)
-      // - Reconstruído: amostra em Fs -> LPF ideal fc=Fs/2 -> reamostra em 44100
-      //   Para soma de cossenos, isso equivale a usar f_alias = wrapToNyquist(f, Fs)
+      // ÁUDIO — versão "bulletproof" para GitHub Pages
+      // - Sempre gera buffer em 44100 Hz.
+      // - Reconstruído: f_alias = wrapToNyquist(f, Fs) (LP ideal fc=Fs/2).
+      // - "Unlock" com oscillator curtíssimo.
+      // - Cria AudioContext no clique (e fecha o anterior) pra evitar estados bugados.
       // =====================
-      const audioRef = useRef({ ctx:null, source:null, gain:null, playing:false })
+      const audioRef = useRef({ ctx:null, source:null, gain:null })
       const [isPlaying, setIsPlaying] = useState(false)
+      const [audioState, setAudioState] = useState('idle')
 
       const stopAudio = useCallback(() => {
         const st = audioRef.current
-        try { if (st?.source) st.source.stop(0) } catch {}
-        if (st) {
-          st.source = null
-          st.playing = false
-        }
+        try { st?.source?.stop(0) } catch {}
+        st.source = null
         setIsPlaying(false)
+        setAudioState(st?.ctx ? st.ctx.state : 'idle')
       }, [])
 
-      // se mudar parâmetros e estiver tocando, para
+      // se mudar parâmetros enquanto toca, para
       useEffect(() => {
         if (isPlaying) stopAudio()
-      }, [isPlaying, stopAudio, fs, discrete, on480, on720, on1200, showFiltered, showOrigInModal, showReconInModal])
+      }, [isPlaying, stopAudio, fs, on480, on720, on1200, showFiltered, showOrigInModal, showReconInModal])
 
-      const playAudio = useCallback(async () => {
+      function synthCosSum(t, freqs) {
+        let y = 0
+        for (let i=0;i<freqs.length;i++){
+          y += Math.cos(2*Math.PI*freqs[i]*t)
+        }
+        return y
+      }
+
+      function buildBuffer(ctx, freqsForAudio) {
+        const sr = 44100
+        const dur = 5.0
+        const N = Math.floor(sr * dur)
+
+        const buf = ctx.createBuffer(1, N, sr)
+        const ch0 = buf.getChannelData(0)
+
+        const nTones = freqsForAudio.length
+        const scale = 0.9 / Math.max(1, nTones)
+
+        for (let i=0;i<N;i++){
+          const t = i / sr
+          ch0[i] = scale * synthCosSum(t, freqsForAudio)
+        }
+        return buf
+      }
+
+      function unlockAudio(ctx) {
+        // Oscillator curto e praticamente inaudível — destrava WebAudio em Safari/iOS e alguns casos chatos
+        const o = ctx.createOscillator()
+        const g = ctx.createGain()
+        g.gain.value = 0.00001
+        o.connect(g)
+        g.connect(ctx.destination)
+        o.start()
+        o.stop(ctx.currentTime + 0.006)
+      }
+
+      const playAudio = useCallback(() => {
+        const fOrig = enabled.slice()
+        if (fOrig.length === 0) return
+
+        const wantRecon = showFiltered && showReconInModal
+        const fRecon = fOrig.map(f => wrapToNyquist(f, fs))
+        const freqsForAudio = wantRecon ? fRecon : fOrig
+
+        // Fecha qualquer contexto anterior (evita "silêncio" por estado ruim)
         try {
-          // sinal correspondente:
-          // - se modal aberto + recon marcado -> toca reconstruído
-          // - senão -> toca original
-          const wantRecon = showFiltered && showReconInModal
-
-          const fOrig = enabled.slice()
-          if (fOrig.length === 0) return
-
-          // reconstrução ideal (conceito) => frequências em baseband
-          const fRecon = fOrig.map(f => wrapToNyquist(f, fs)) // pode ser negativo
-
-          // "repassar" para 44100 Hz (gera o sinal reconstruído e amostra em 44100)
-          const freqsForAudio = wantRecon ? fRecon : fOrig
-
-          // CRÍTICO: criar/retomar AudioContext dentro do clique
-          let ctx = audioRef.current.ctx
-          if (!ctx || ctx.state === 'closed') {
-            ctx = new (window.AudioContext || window.webkitAudioContext)()
-            audioRef.current.ctx = ctx
+          if (audioRef.current?.ctx && audioRef.current.ctx.state !== 'closed') {
+            try { audioRef.current.source?.stop(0) } catch {}
+            audioRef.current.source = null
+            audioRef.current.gain = null
+            audioRef.current.ctx.close()
           }
-          if (ctx.state === 'suspended') await ctx.resume()
+        } catch {}
 
-          // Gain explícito
-          let gain = audioRef.current.gain
-          if (!gain) {
-            gain = ctx.createGain()
+        const Ctx = window.AudioContext || window.webkitAudioContext
+        const ctx = new Ctx()
+        audioRef.current.ctx = ctx
+        setAudioState(ctx.state)
+
+        const startNow = () => {
+          try {
+            unlockAudio(ctx)
+
+            const gain = ctx.createGain()
             gain.gain.value = 0.9
             gain.connect(ctx.destination)
             audioRef.current.gain = gain
-          }
 
-          const sr = 44100
-          const dur = 5.0
-          const N = Math.floor(sr * dur)
+            const buf = buildBuffer(ctx, freqsForAudio)
 
-          const buf = ctx.createBuffer(1, N, sr)
-          const ch0 = buf.getChannelData(0)
+            const src = ctx.createBufferSource()
+            src.buffer = buf
+            src.connect(gain)
 
-          // normalização simples
-          const nTones = freqsForAudio.length
-          const scale = 0.9 / Math.max(1, nTones)
-
-          for (let i=0;i<N;i++){
-            const t = i / sr
-            let y = 0
-            for (let k=0;k<freqsForAudio.length;k++){
-              const f = freqsForAudio[k]
-              y += Math.cos(2*Math.PI*f*t) // f negativo ok
+            src.onended = () => {
+              setIsPlaying(false)
+              setAudioState(ctx.state)
+              audioRef.current.source = null
             }
-            ch0[i] = scale * y
-          }
 
-          // tocar
-          stopAudio()
-          const src = ctx.createBufferSource()
-          src.buffer = buf
-          src.connect(gain)
-          src.onended = () => {
-            audioRef.current.source = null
-            audioRef.current.playing = false
+            audioRef.current.source = src
+            setIsPlaying(true)
+            setAudioState(ctx.state)
+
+            src.start(0)
+          } catch (err) {
+            console.warn('Erro ao iniciar áudio:', err)
             setIsPlaying(false)
+            setAudioState(ctx.state)
+            alert('Falha ao iniciar o áudio. Veja o console (F12).')
           }
-          audioRef.current.source = src
-          audioRef.current.playing = true
-          setIsPlaying(true)
-          src.start(0)
-        } catch (err) {
-          console.warn('Erro ao tocar áudio:', err)
-          stopAudio()
-          alert('Não foi possível tocar o áudio. Veja o console (F12) para detalhes.')
         }
-      }, [enabled, fs, showFiltered, showReconInModal, stopAudio])
+
+        // Alguns browsers precisam do resume() (sem await pra não "perder" o gesto do clique)
+        if (ctx.state === 'suspended') {
+          ctx.resume().then(() => {
+            setAudioState(ctx.state)
+            startNow()
+          }).catch(err => {
+            console.warn('resume() falhou:', err)
+            setAudioState(ctx.state)
+            alert('O navegador bloqueou o áudio (resume falhou).')
+          })
+        } else {
+          startNow()
+        }
+      }, [enabled, fs, showFiltered, showReconInModal])
 
       // =====================
-      // Sinal: soma de cossenos
+      // Tempo: contínuo + amostras
       // =====================
-      const synthValue = useCallback((t, freqs, amp=1.0) => {
-        let y = 0
-        for (let i=0;i<freqs.length;i++){
-          const f = freqs[i]
-          y += amp * Math.cos(2*Math.PI*f*t)
-        }
-        return y
-      }, [])
-
-      // tempo (contínuo + amostras)
       const timeData = useMemo(() => {
-        // contínuo
         const x = new Float64Array(Ncont)
         const y = new Float64Array(Ncont)
         for (let i=0;i<Ncont;i++){
           const t = (i/(Ncont-1))*Tview
           x[i]=t
-          y[i]=synthValue(t, enabled, 1.0)
+          y[i]=synthCosSum(t, enabled)
         }
 
-        // amostras
         const FsEff = Math.max(200, Math.min(12000, fs))
         const Ns = Math.max(2, Math.floor(Tview*FsEff) + 1)
         const xs = new Float64Array(Ns)
@@ -448,13 +471,11 @@
         for (let n=0;n<Ns;n++){
           const t = n/FsEff
           xs[n] = t
-          ys[n] = synthValue(t, enabled, 1.0)
+          ys[n] = synthCosSum(t, enabled)
         }
-
         return { x, y, xs, ys }
-      }, [fs, enabled, synthValue])
+      }, [fs, enabled])
 
-      // range Y (tempo)
       const timeYRange = useMemo(() => {
         let ymin = +Infinity, ymax = -Infinity
         for (let i=0;i<timeData.y.length;i++){
@@ -474,7 +495,7 @@
       }, [timeData])
 
       // =====================
-      // Espectro (visual): diracs + réplicas
+      // Espectro (visual)
       // =====================
       const SPEC_MIN = -6000
       const SPEC_MAX =  6000
@@ -483,22 +504,12 @@
         const baseAmp = 0.5
         const yMax = Math.max(1, enabled.length) * baseAmp * 1.25
 
-        if (!discrete) {
-          const freqs = []
-          const amps  = []
-          for (const f of enabled) {
-            freqs.push(-f, +f)
-            amps.push(baseAmp, baseAmp)
-          }
-          return { fMin: -1500, fMax: 1500, yMax, freqs, amps }
-        }
+        const freqs = []
+        const amps  = []
 
         const spanGen = Math.max(2.2*fs, 6000)
         const fMinG = -spanGen
         const fMaxG =  spanGen
-
-        const freqs = []
-        const amps  = []
 
         for (const f0 of enabled) {
           const kMin = Math.floor((fMinG - f0) / fs) - 1
@@ -522,27 +533,24 @@
           }
         }
 
-        const fMin = SPEC_MIN
-        const fMax = SPEC_MAX
-
-        // filtra janela
+        // janela
         const wf = []
         const wa = []
         for (let i=0;i<uf.length;i++){
-          if (uf[i] >= fMin && uf[i] <= fMax) {
+          if (uf[i] >= SPEC_MIN && uf[i] <= SPEC_MAX) {
             wf.push(uf[i])
             wa.push(ua[i])
           }
         }
 
-        return { fMin, fMax, yMax, freqs: wf, amps: wa }
-      }, [enabled, discrete, fs])
+        return { fMin: SPEC_MIN, fMax: SPEC_MAX, yMax, freqs: wf, amps: wa }
+      }, [enabled, fs])
 
       // =====================
-      // Reconstrução (tempo) via alias em baseband (LP ideal fc=Fs/2)
+      // Reconstrução (tempo) — LP ideal fc=Fs/2 (alias para baseband)
       // =====================
       const reconTime = useMemo(() => {
-        const aliased = enabled.map(f => wrapToNyquist(f, fs)) // [-Fs/2, Fs/2)
+        const aliased = enabled.map(f => wrapToNyquist(f, fs))
         const x = new Float64Array(Ncont)
         const y = new Float64Array(Ncont)
 
@@ -550,7 +558,7 @@
         for (let i=0;i<Ncont;i++){
           const t = (i/(Ncont-1))*Tview
           x[i] = t
-          const v = synthValue(t, aliased, 1.0)
+          const v = synthCosSum(t, aliased)
           y[i] = v
           if (v<ymin) ymin=v
           if (v>ymax) ymax=v
@@ -559,7 +567,7 @@
         const span = Math.max(1e-6, ymax-ymin)
         const padY = 0.18*span
         return { x, y, yMin: ymin-padY, yMax: ymax+padY, aliased }
-      }, [enabled, fs, synthValue])
+      }, [enabled, fs])
 
       const modalYRange = useMemo(() => {
         let ymin = +Infinity, ymax = -Infinity
@@ -642,6 +650,7 @@
         const { xScale, yScale } = makeScales(W, H, pad, spec.fMin, spec.fMax, 0, spec.yMax)
         drawAxesLabels(ctx, W, H, pad, 'Frequência (Hz)', 'Magnitude (visual)')
 
+        // passband reconstrução (sempre fc=Fs/2 quando discreto)
         if (discrete) {
           const yTop = pad.t
           const yBot = H - pad.b
@@ -666,9 +675,9 @@
         ctx.fillStyle = getCSSVar('--inkDim')
         ctx.font = '12px system-ui, sans-serif'
         ctx.textAlign = 'left'
-        const lbl = !discrete
-          ? 'Espectro (contínuo): deltas em ±fi'
-          : `Espectro (amostrado): réplicas em k·Fs ± fi | reconstrução: LP ideal fc=Fs/2=${fc.toFixed(0)} Hz`
+        const lbl = discrete
+          ? `Espectro (amostrado): réplicas em k·Fs ± fi | recon: LP ideal fc=Fs/2=${fc.toFixed(0)} Hz`
+          : 'Espectro (contínuo): deltas em ±fi'
         ctx.fillText(lbl, pad.l, 14)
       }, [spec, discrete, fc, theme])
 
@@ -699,9 +708,9 @@
         ctx.fillStyle = getCSSVar('--inkDim')
         ctx.font = '12px system-ui, sans-serif'
         ctx.textAlign = 'left'
-        const ali = discrete ? reconTime.aliased.map(f=>f.toFixed(2)).join(', ') : '—'
-        ctx.fillText(`Original + Reconstrução (fc=Fs/2) | f_alias (Hz): ${ali}`, pad.l, 14)
-      }, [reconTime, timeData, modalYRange, showOrigInModal, showReconInModal, theme, discrete])
+        const ali = reconTime.aliased.map(f=>f.toFixed(2)).join(', ')
+        ctx.fillText(`Original + Reconstrução | f_alias (Hz): ${ali}`, pad.l, 14)
+      }, [reconTime, timeData, modalYRange, showOrigInModal, showReconInModal, theme])
 
       useEffect(() => { if (showFiltered) drawRecon() }, [showFiltered, drawRecon])
       useCanvas(reconCanvasRef, drawRecon)
@@ -726,13 +735,13 @@
         }
 
         const t = xInv(px)
-        const y = synthValue(t, enabled, 1.0)
+        const y = synthCosSum(t, enabled)
 
         let extra = ''
         if (discrete) {
           const n = Math.round(t * fs)
           const ts = n / fs
-          const ys = synthValue(ts, enabled, 1.0)
+          const ys = synthCosSum(ts, enabled)
           extra = ` | amostra: t=${ts.toFixed(6)} s, y=${ys.toFixed(4)}`
         }
 
@@ -743,7 +752,7 @@
           y: e.clientY - wrapRect.top + 12,
           text: `t=${t.toFixed(6)} s, y=${y.toFixed(4)}${extra}`
         })
-      }, [fs, discrete, enabled, synthValue, Tview, timeYRange])
+      }, [fs, discrete, enabled, Tview, timeYRange])
 
       const onSpecMove = useCallback((e) => {
         const wrap = specWrapRef.current
@@ -877,8 +886,8 @@
             <div>
               <h1>Amostragem no domínio da frequência — 3 cossenoides</h1>
               <div className="subtitle">
-                Sinal original = soma das cossenoides ligadas (480, 720, 1200 Hz).
-                Reconstrução sempre via LP ideal com <b>fc = Fs/2</b>. Áudio: 5 s em 44100 Hz.
+                Sinal original = soma das cossenoides ligadas (480, 720, 1200 Hz). Reconstrução: LP ideal com <b>fc=Fs/2</b>.
+                Áudio: 5 s em 44100 Hz (reconstruído = alias em baseband).
               </div>
             </div>
 
@@ -900,6 +909,7 @@
                   <Pill>Nyquist: <b>{(fs/2).toFixed(0)}</b> Hz</Pill>
                   <Pill strong>fc: <b>{(fs/2).toFixed(0)}</b> Hz</Pill>
                   {aliasRisk && <Pill warn>⚠ aliasing (algum tom &gt; Fs/2)</Pill>}
+                  <Pill>audio ctx: <b>{audioState}</b></Pill>
                 </>
               }
             >
@@ -917,8 +927,7 @@
 
                 <div className="plotWrap" ref={specWrapRef}>
                   <div className="note">
-                    <b>Frequência</b> — {discrete ? 'réplicas (k·Fs ± fi)' : 'deltas em ±fi'}
-                    {discrete ? ` | passband (reconstrução): |f|≤fc=Fs/2=${fc.toFixed(0)} Hz` : ''} 
+                    <b>Frequência</b> — réplicas (k·Fs ± fi) | passband (recon): |f|≤fc=Fs/2={fc.toFixed(0)} Hz
                   </div>
                   <canvas
                     className="main"
@@ -938,9 +947,6 @@
                   <Toggle label="cos 480 Hz" checked={on480} onChange={setOn480} />
                   <Toggle label="cos 720 Hz" checked={on720} onChange={setOn720} />
                   <Toggle label="cos 1200 Hz" checked={on1200} onChange={setOn1200} />
-                </div>
-                <div className="note" style={{marginTop:8}}>
-                  Cada componente ligada tem amplitude 1.0. O áudio normaliza automaticamente para evitar clipping.
                 </div>
               </div>
 
@@ -991,8 +997,8 @@
                 </div>
 
                 <div className="note" style={{marginTop:8}}>
-                  O botão de áudio toca o sinal “correspondente”: se o modal estiver aberto com “Reconstruído” marcado,
-                  toca a reconstrução (após LP ideal fc=Fs/2 e reamostragem em 44100). Caso contrário, toca o original.
+                  Áudio: se o modal estiver aberto e “Reconstruído” estiver marcado, toca a reconstrução (alias na baseband).
+                  Caso contrário, toca o original.
                 </div>
               </div>
             </Panel>
@@ -1009,8 +1015,7 @@
             </div>
 
             <div className="note" style={{marginBottom:10}}>
-              Reconstrução modelada como soma das frequências em baseband:
-              <b> f_alias = wrapToNyquist(fi, Fs) ∈ [-Fs/2, Fs/2)</b>, com <b>fc=Fs/2</b>.
+              Reconstrução: <b>f_alias = wrapToNyquist(fi, Fs)</b> e soma de cossenos no tempo.
             </div>
 
             <canvas className="main" ref={reconCanvasRef} />
