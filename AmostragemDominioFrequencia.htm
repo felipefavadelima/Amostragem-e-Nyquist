@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="pt-BR" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Amostragem no domínio da Frequência</title>
+
+  <script>
+    (function () {
+      document.documentElement.setAttribute('data-theme', 'light');
+    })();
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState, useCallback } = React
+
+    // =====================
+    // Canvas helpers
+    // =====================
+    function useCanvas(ref, draw) {
+      useEffect(() => {
+        const onResize = () => draw()
+        window.addEventListener('resize', onResize)
+        draw()
+        return () => window.removeEventListener('resize', onResize)
+      }, [draw])
+    }
+
+    function fitCanvas(canvas) {
+      const dpr = window.devicePixelRatio || 1
+      const cw = canvas.clientWidth || 800
+      const ch = canvas.clientHeight || 320
+      canvas.width  = Math.round(cw * dpr)
+      canvas.height = Math.round(ch * dpr)
+      const ctx = canvas.getContext('2d')
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      return { ctx, W: cw, H: ch }
+    }
+
+    function getCSSVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+    }
+
+    function drawGrid(ctx, W, H, pad, xTicks=6, yTicks=6) {
+      const bg = getCSSVar('--canvas')
+      const gridV = getCSSVar('--gridV')
+      const gridH = getCSSVar('--gridH')
+      const frame = getCSSVar('--frame')
+
+      ctx.fillStyle = bg
+      ctx.fillRect(0,0,W,H)
+
+      ctx.strokeStyle = gridV
+      ctx.lineWidth = 1
+      for (let i=0;i<xTicks;i++){
+        const x = pad.l + (W-pad.l-pad.r)*(i/(xTicks-1))
+        ctx.beginPath(); ctx.moveTo(x,pad.t); ctx.lineTo(x,H-pad.b); ctx.stroke()
+      }
+
+      ctx.strokeStyle = gridH
+      ctx.lineWidth = 1
+      for (let i=0;i<yTicks;i++){
+        const y = pad.t + (H-pad.t-pad.b)*(i/(yTicks-1))
+        ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke()
+      }
+
+      ctx.strokeStyle = frame
+      ctx.strokeRect(pad.l, pad.t, W-pad.l-pad.r, H-pad.t-pad.b)
+    }
+
+    function makeScales(W, H, pad, xMin, xMax, yMin, yMax) {
+      const xScale = x => pad.l + (W-pad.l-pad.r) * ((x - xMin) / (xMax - xMin || 1))
+      const yScale = y => {
+        const p = (y - yMin) / (yMax - yMin || 1)
+        return H - pad.b - p*(H-pad.t-pad.b)
+      }
+      const xInv = px => xMin + ((px - pad.l) / (W-pad.l-pad.r)) * (xMax-xMin)
+      return { xScale, yScale, xInv }
+    }
+
+    function drawAxesLabels(ctx, W, H, pad, xLabel, yLabel) {
+      const inkDim = getCSSVar('--inkDim')
+      ctx.fillStyle = inkDim
+      ctx.font = '12px system-ui, sans-serif'
+
+      ctx.textAlign = 'right'
+      ctx.fillText(xLabel, W-8, H-10)
+
+      ctx.save()
+      ctx.translate(14, pad.t + (H-pad.t-pad.b)/2)
+      ctx.rotate(-Math.PI/2)
+      ctx.textAlign = 'center'
+      ctx.fillText(yLabel, 0, 0)
+      ctx.restore()
+    }
+
+    function drawNumericAxes(ctx, W, H, pad, xMin, xMax, yMin, yMax, xTicks=6, yTicks=6) {
+      const inkDim = getCSSVar('--inkDim')
+      const frame = getCSSVar('--frame')
+      ctx.font = '12px system-ui, sans-serif'
+      ctx.fillStyle = inkDim
+      ctx.strokeStyle = frame
+      ctx.lineWidth = 1
+
+      const { xScale, yScale } = makeScales(W, H, pad, xMin, xMax, yMin, yMax)
+
+      // X ticks
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'top'
+      for (let i=0;i<xTicks;i++){
+        const t = i/(xTicks-1)
+        const xv = xMin + t*(xMax-xMin)
+        const x = xScale(xv)
+        const y0 = H - pad.b
+        ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y0+5); ctx.stroke()
+        const txt = Math.abs(xv) < 1e-12 ? '0' : (Math.abs(xv) < 10 ? xv.toFixed(2) : xv.toFixed(0))
+        ctx.fillText(txt, x, y0+7)
+      }
+
+      // Y ticks
+      ctx.textAlign = 'right'
+      ctx.textBaseline = 'middle'
+      for (let i=0;i<yTicks;i++){
+        const t = i/(yTicks-1)
+        const yv = yMin + (1-t)*(yMax-yMin)
+        const y = yScale(yv)
+        const x0 = pad.l
+        ctx.beginPath(); ctx.moveTo(x0-5, y); ctx.lineTo(x0, y); ctx.stroke()
+        const txt = Math.abs(yv) < 1e-12 ? '0' : (Math.abs(yv) < 10 ? yv.toFixed(2) : yv.toFixed(1))
+        ctx.fillText(txt, x0-7, y)
+      }
+    }
+
+    function drawLine(ctx, xs, ys, xScale, yScale, colorVar='--recon', width=2) {
+      if (!xs.length) return
+      ctx.strokeStyle = getCSSVar(colorVar)
+      ctx.lineWidth = width
+      ctx.beginPath()
+      for (let i=0;i<xs.length;i++){
+        const x = xScale(xs[i])
+        const y = yScale(ys[i])
+        if (i===0) ctx.moveTo(x,y)
+        else ctx.lineTo(x,y)
+      }
+      ctx.stroke()
+    }
+
+    function drawStems(ctx, xs, ys, xScale, yScale, baseY=0, colorVar='--recon') {
+      const col = getCSSVar(colorVar)
+      ctx.strokeStyle = col
+      ctx.lineWidth = 1.5
+      const y0 = yScale(baseY)
+      for (let i=0;i<xs.length;i++){
+        const x = xScale(xs[i])
+        const y = yScale(ys[i])
+        ctx.beginPath()
+        ctx.moveTo(x, y0)
+        ctx.lineTo(x, y)
+        ctx.stroke()
+      }
+      ctx.fillStyle = col
+      for (let i=0;i<xs.length;i++){
+        const x = xScale(xs[i])
+        const y = yScale(ys[i])
+        ctx.beginPath()
+        ctx.arc(x, y, 2.2, 0, 2*Math.PI)
+        ctx.fill()
+      }
+    }
+
+    function drawSpectralDiracs(ctx, freqs, amps, xScale, yScale, colorVar='--recon') {
+      const col = getCSSVar(colorVar)
+      ctx.strokeStyle = col
+      ctx.lineWidth = 2
+      const y0 = yScale(0)
+      for (let i=0;i<freqs.length;i++){
+        const x = xScale(freqs[i])
+        const y = yScale(amps[i])
+        ctx.beginPath()
+        ctx.moveTo(x, y0)
+        ctx.lineTo(x, y)
+        ctx.stroke()
+        ctx.fillStyle = col
+        ctx.beginPath()
+        ctx.arc(x, y, 3, 0, 2*Math.PI)
+        ctx.fill()
+      }
+    }
+
+    function drawPassband(ctx, xScale, yTop, yBot, fc, colorVar='--pass') {
+      const col = getCSSVar(colorVar)
+      const x1 = xScale(-fc)
+      const x2 = xScale( fc)
+      ctx.fillStyle = col
+      ctx.globalAlpha = 0.20
+      ctx.fillRect(Math.min(x1,x2), yTop, Math.abs(x2-x1), yBot-yTop)
+      ctx.globalAlpha = 1.0
+      ctx.strokeStyle = col
+      ctx.lineWidth = 1.5
+      ctx.strokeRect(Math.min(x1,x2), yTop, Math.abs(x2-x1), yBot-yTop)
+    }
+
+    // =====================
+    // UI components
+    // =====================
+    function Panel({title, right, children}) {
+      return (
+        <div className="panel">
+          <div className="panelHead">
+            <div className="panelTitle">{title}</div>
+            <div className="panelRight">{right}</div>
+          </div>
+          {children}
+        </div>
+      )
+    }
+
+    function Pill({children, strong, warn}) {
+      return <span className={warn ? "pill pillWarn" : (strong ? "pill pillStrong" : "pill")}>{children}</span>
+    }
+
+    function Btn({variant="primary", onClick, disabled, children}) {
+      return (
+        <button className={`btn ${variant}`} onClick={onClick} disabled={disabled}>
+          {children}
+        </button>
+      )
+    }
+
+    function Toggle({label, checked, onChange, disabled}) {
+      return (
+        <div className="toggle" style={disabled ? {opacity:.55, cursor:'not-allowed'} : null}>
+          <span>{label}</span>
+          <input type="checkbox" checked={checked} disabled={disabled} onChange={e=>onChange(e.target.checked)} />
+        </div>
+      )
+    }
+
+    function Modal({open, title, onClose, children}) {
+      if (!open) return null
+      return (
+        <div className="modalOverlay" role="dialog" aria-modal="true">
+          <div className="modal">
+            <div className="modalHead">
+              <div className="modalTitle">{title}</div>
+              <button className="iconBtn" onClick={onClose} aria-label="Fechar">✕</button>
+            </div>
+            <div className="modalBody">{children}</div>
+          </div>
+        </div>
+      )
+    }
+
+    function Tooltip({state}) {
+      if (!state?.show) return null
+      const { x, y, text } = state
+      return <div className="tip" style={{left:x, top:y}}>{text}</div>
+    }
+
+    // =====================
+    // App
+    // =====================
+    function App() {
+      const [theme, setTheme] = useState('light')
+      useEffect(() => {
+        document.documentElement.setAttribute('data-theme', theme)
+      }, [theme])
+
+      const f0 = 60.0
+      const A = 1.0
+
+      // padrão: discretizar desligado
+      const [discrete, setDiscrete] = useState(false)
+      const [fs, setFs] = useState(200.0) // 1..1000
+
+      const [useLPF, setUseLPF] = useState(false)
+      const [autoFc, setAutoFc] = useState(true)
+      const [fcManual, setFcManual] = useState(80.0)
+
+      const [showFiltered, setShowFiltered] = useState(false)
+
+      // modal toggles
+      const [showOrigInModal, setShowOrigInModal] = useState(true)
+      const [showReconInModal, setShowReconInModal] = useState(true)
+
+      const T = 0.12
+      const Ncont = 1100
+      const pad = { l: 64, r: 18, t: 18, b: 44 }
+
+      const [tipTime, setTipTime] = useState({show:false})
+      const [tipSpec, setTipSpec] = useState({show:false})
+
+      const fcEff = useMemo(() => (autoFc ? fs/2 : fcManual), [autoFc, fs, fcManual])
+
+      useEffect(() => {
+        if (autoFc) setFcManual(fs/2)
+      }, [autoFc, fs])
+
+      // tempo (original contínuo e amostras)
+      const timeData = useMemo(() => {
+        const x = new Float64Array(Ncont)
+        const y = new Float64Array(Ncont)
+        for (let i=0;i<Ncont;i++){
+          const t = (i/(Ncont-1))*T
+          x[i]=t
+          y[i]=A*Math.sin(2*Math.PI*f0*t)
+        }
+
+        const FsEff = Math.max(1, fs)
+        const Ns = Math.max(2, Math.floor(T*FsEff) + 1)
+        const xs = new Float64Array(Ns)
+        const ys = new Float64Array(Ns)
+        for (let n=0;n<Ns;n++){
+          const t = n/FsEff
+          xs[n] = t
+          ys[n] = A*Math.sin(2*Math.PI*f0*t)
+        }
+
+        return { x, y, xs, ys }
+      }, [fs])
+
+      // =====================
+      // Espectro com "origem" (neg vs pos)
+      // - origem "neg": réplicas de (-f0): k*Fs - f0  -> deve ser VERMELHO
+      // - origem "pos": réplicas de (+f0): k*Fs + f0  -> deve ser PRETO (ou "ink")
+      // =====================
+      const components = useMemo(() => {
+        const baseAmp = A/2
+        let comps = []
+
+        if (!discrete) {
+          comps = [
+            { f: -f0, A: baseAmp, phi: +Math.PI/2, origin: 'neg' },
+            { f: +f0, A: baseAmp, phi: -Math.PI/2, origin: 'pos' }
+          ]
+        } else {
+          const spanGen = Math.max(3*fs, 800)
+          const fMinG = -spanGen
+          const fMaxG =  spanGen
+          const kMin = Math.floor((fMinG - f0) / fs) - 1
+          const kMax = Math.ceil((fMaxG + f0) / fs) + 1
+
+          for (let k=kMin; k<=kMax; k++){
+            const fNeg = k*fs - f0 // origem do -f0
+            const fPos = k*fs + f0 // origem do +f0
+            comps.push({ f: fNeg, A: baseAmp, phi: (fNeg>=0 ? -Math.PI/2 : +Math.PI/2), origin: 'neg' })
+            comps.push({ f: fPos, A: baseAmp, phi: (fPos>=0 ? -Math.PI/2 : +Math.PI/2), origin: 'pos' })
+          }
+        }
+
+        // dedup (freq iguais)
+        const key = c => `${Math.round(c.f*1e6)}|${c.origin}`
+        const seen = new Set()
+        const unique = []
+        for (const c of comps) {
+          const k = key(c)
+          if (!seen.has(k)) { seen.add(k); unique.push(c) }
+        }
+        unique.sort((a,b)=>a.f-b.f)
+        return unique
+      }, [discrete, fs])
+
+      const SPEC_MIN = -200
+      const SPEC_MAX =  200
+
+      const spec = useMemo(() => {
+        const baseAmp = A/2
+        const yMax = baseAmp * 1.4
+
+        const inSpan = components.filter(c => c.f>=SPEC_MIN && c.f<=SPEC_MAX)
+
+        // separa por origem (neg/pos)
+        const neg = inSpan.filter(c=>c.origin==='neg')
+        const pos = inSpan.filter(c=>c.origin==='pos')
+
+        const negFreqs = neg.map(c=>c.f)
+        const posFreqs = pos.map(c=>c.f)
+
+        const negAmps  = neg.map(c=>c.A)
+        const posAmps  = pos.map(c=>c.A)
+
+        const negPass  = useLPF ? neg.map(c => (Math.abs(c.f)<=fcEff ? c.A : 0)) : negAmps.slice()
+        const posPass  = useLPF ? pos.map(c => (Math.abs(c.f)<=fcEff ? c.A : 0)) : posAmps.slice()
+
+        const compsPass = useLPF
+          ? components.filter(c => Math.abs(c.f)<=fcEff)
+          : components.slice()
+
+        return {
+          fMin: SPEC_MIN, fMax: SPEC_MAX, yMax,
+          negFreqs, posFreqs,
+          negAmps,  posAmps,
+          negPass,  posPass,
+          compsPass
+        }
+      }, [components, useLPF, fcEff])
+
+      // reconstrução (tempo) via soma de componentes passantes
+      const reconTime = useMemo(() => {
+        const x = new Float64Array(Ncont)
+        const y = new Float64Array(Ncont)
+        const comps = spec.compsPass
+
+        let ymin = +Infinity, ymax = -Infinity
+        for (let i=0;i<Ncont;i++){
+          const t = (i/(Ncont-1))*T
+          x[i] = t
+          let acc = 0
+          for (let k=0;k<comps.length;k++){
+            const c = comps[k]
+            acc += c.A * Math.cos(2*Math.PI*c.f*t + c.phi)
+          }
+          y[i] = acc
+          if (acc < ymin) ymin = acc
+          if (acc > ymax) ymax = acc
+        }
+
+        if (!Number.isFinite(ymin) || !Number.isFinite(ymax)) { ymin=-1; ymax=1 }
+        const span = Math.max(1e-6, ymax - ymin)
+        const padY = 0.12 * span
+        let yMin = ymin - padY
+        let yMax = ymax + padY
+        if (Math.abs(yMax - yMin) < 1e-3) { yMin=-0.1; yMax=+0.1 }
+
+        return { x, y, yMin, yMax, nComps: comps.length }
+      }, [spec.compsPass])
+
+      // Modal: eixo Y automático baseado no que está visível (orig/recon)
+      const modalYRange = useMemo(() => {
+        let ymin = +Infinity, ymax = -Infinity
+        if (showOrigInModal) {
+          for (let i=0;i<timeData.y.length;i++){
+            const v = timeData.y[i]
+            if (v<ymin) ymin=v
+            if (v>ymax) ymax=v
+          }
+        }
+        if (showReconInModal) {
+          for (let i=0;i<reconTime.y.length;i++){
+            const v = reconTime.y[i]
+            if (v<ymin) ymin=v
+            if (v>ymax) ymax=v
+          }
+        }
+        if (!Number.isFinite(ymin) || !Number.isFinite(ymax)) { ymin=-1; ymax=1 }
+        const span = Math.max(1e-6, ymax-ymin)
+        const padY = 0.12*span
+        return { yMin: ymin-padY, yMax: ymax+padY }
+      }, [showOrigInModal, showReconInModal, timeData, reconTime])
+
+      // Draw time
+      const timeWrapRef = useRef(null)
+      const timeCanvasRef = useRef(null)
+      const drawTime = useCallback(() => {
+        const canvas = timeCanvasRef.current
+        if (!canvas) return
+        const { ctx, W, H } = fitCanvas(canvas)
+
+        drawGrid(ctx, W, H, pad, 6, 6)
+        drawNumericAxes(ctx, W, H, pad, 0, T, -1.15, 1.15, 6, 7)
+
+        const { xScale, yScale } = makeScales(W, H, pad, 0, T, -1.15, 1.15)
+        drawAxesLabels(ctx, W, H, pad, 'Tempo (s)', 'Amplitude')
+
+        ctx.strokeStyle = getCSSVar('--gridH')
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.moveTo(pad.l, yScale(0))
+        ctx.lineTo(W-pad.r, yScale(0))
+        ctx.stroke()
+
+        if (!discrete) {
+          drawLine(ctx, timeData.x, timeData.y, xScale, yScale, '--recon', 2.2)
+        } else {
+          drawLine(ctx, timeData.x, timeData.y, xScale, yScale, '--orig', 1.2)
+          drawStems(ctx, timeData.xs, timeData.ys, xScale, yScale, 0, '--recon')
+        }
+
+        ctx.fillStyle = getCSSVar('--inkDim')
+        ctx.font = '12px system-ui, sans-serif'
+        ctx.textAlign = 'left'
+        ctx.fillText(discrete ? 'Tempo: amostrado (Deltas de Dirac)' : 'Tempo: senoide contínua', pad.l, 14)
+      }, [timeData, discrete, fs, theme])
+
+      useCanvas(timeCanvasRef, drawTime)
+
+      // Draw spectrum (cores por origem)
+      const specWrapRef = useRef(null)
+      const specCanvasRef = useRef(null)
+      const drawSpec = useCallback(() => {
+        const canvas = specCanvasRef.current
+        if (!canvas) return
+        const { ctx, W, H } = fitCanvas(canvas)
+
+        drawGrid(ctx, W, H, pad, 9, 6)
+        drawNumericAxes(ctx, W, H, pad, spec.fMin, spec.fMax, 0, spec.yMax, 9, 6)
+
+        const { xScale, yScale } = makeScales(W, H, pad, spec.fMin, spec.fMax, 0, spec.yMax)
+        drawAxesLabels(ctx, W, H, pad, 'Frequência (Hz)', 'Magnitude (visual)')
+
+        if (useLPF) {
+          const yTop = pad.t
+          const yBot = H - pad.b
+          drawPassband(ctx, xScale, yTop, yBot, fcEff, '--pass')
+
+          ctx.strokeStyle = getCSSVar('--passLine')
+          ctx.lineWidth = 1.6
+          const x1 = xScale(-fcEff), x2 = xScale(fcEff)
+          ctx.beginPath(); ctx.moveTo(x1, pad.t); ctx.lineTo(x1, H-pad.b); ctx.stroke()
+          ctx.beginPath(); ctx.moveTo(x2, pad.t); ctx.lineTo(x2, H-pad.b); ctx.stroke()
+        }
+
+        ctx.strokeStyle = getCSSVar('--gridV')
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.moveTo(xScale(0), pad.t)
+        ctx.lineTo(xScale(0), H-pad.b)
+        ctx.stroke()
+
+        // ORIGINAL (referência): origem neg = vermelho, origem pos = preto/ink
+        drawSpectralDiracs(ctx, spec.negFreqs, spec.negAmps, xScale, yScale, '--negPulse')
+        drawSpectralDiracs(ctx, spec.posFreqs, spec.posAmps, xScale, yScale, '--posPulse')
+
+        // APÓS LPF (sobreposição): mesmas cores por origem
+        drawSpectralDiracs(ctx, spec.negFreqs, spec.negPass, xScale, yScale, '--negPulse')
+        drawSpectralDiracs(ctx, spec.posFreqs, spec.posPass, xScale, yScale, '--posPulse')
+
+        ctx.fillStyle = getCSSVar('--inkDim')
+        ctx.font = '12px system-ui, sans-serif'
+        ctx.textAlign = 'left'
+        const lbl = !discrete ? 'Espectro: deltas em ±60 Hz' : 'Espectro: réplicas em k·Fs ± 60 Hz'
+        ctx.fillText(lbl, pad.l, 14)
+      }, [spec, discrete, useLPF, fcEff, theme])
+
+      useCanvas(specCanvasRef, drawSpec)
+
+      // Modal draw: original + reconstruído (com toggles)
+      const reconCanvasRef = useRef(null)
+      const drawRecon = useCallback(() => {
+        const canvas = reconCanvasRef.current
+        if (!canvas) return
+        const { ctx, W, H } = fitCanvas(canvas)
+
+        const yMin = modalYRange.yMin
+        const yMax = modalYRange.yMax
+
+        drawGrid(ctx, W, H, pad, 6, 6)
+        drawNumericAxes(ctx, W, H, pad, 0, T, yMin, yMax, 6, 7)
+
+        const { xScale, yScale } = makeScales(W, H, pad, 0, T, yMin, yMax)
+        drawAxesLabels(ctx, W, H, pad, 'Tempo (s)', 'Amplitude')
+
+        if (showOrigInModal) drawLine(ctx, timeData.x, timeData.y, xScale, yScale, '--orig', 2.0)
+        if (showReconInModal) drawLine(ctx, reconTime.x, reconTime.y, xScale, yScale, '--recon', 2.2)
+
+        ctx.fillStyle = getCSSVar('--inkDim')
+        ctx.font = '12px system-ui, sans-serif'
+        ctx.textAlign = 'left'
+        ctx.fillText(`Original + Reconstrução`, pad.l, 14)
+      }, [reconTime, timeData, modalYRange, showOrigInModal, showReconInModal, theme])
+
+      useEffect(() => { if (showFiltered) drawRecon() }, [showFiltered, drawRecon])
+      useCanvas(reconCanvasRef, drawRecon)
+
+      // Tooltips
+      const onTimeMove = useCallback((e) => {
+        const wrap = timeWrapRef.current
+        const canvas = timeCanvasRef.current
+        if (!wrap || !canvas) return
+
+        const rect = canvas.getBoundingClientRect()
+        const px = e.clientX - rect.left
+        const py = e.clientY - rect.top
+        const W = rect.width, H = rect.height
+
+        const { xInv } = makeScales(W, H, pad, 0, T, -1.15, 1.15)
+        if (px < pad.l || px > (W - pad.r) || py < pad.t || py > (H - pad.b)) {
+          setTipTime({show:false})
+          return
+        }
+
+        const t = xInv(px)
+        const y = A*Math.sin(2*Math.PI*f0*t)
+
+        let extra = ''
+        if (discrete) {
+          const n = Math.round(t * fs)
+          const ts = n / fs
+          const ys = A*Math.sin(2*Math.PI*f0*ts)
+          extra = ` | amostra: t=${ts.toFixed(6)} s, y=${ys.toFixed(4)}`
+        }
+
+        const wrapRect = wrap.getBoundingClientRect()
+        setTipTime({
+          show:true,
+          x: e.clientX - wrapRect.left + 12,
+          y: e.clientY - wrapRect.top + 12,
+          text: `t=${t.toFixed(6)} s, y=${y.toFixed(4)}${extra}`
+        })
+      }, [fs, discrete])
+
+      // Tooltip espectro: procura haste mais próxima (neg + pos)
+      const onSpecMove = useCallback((e) => {
+        const wrap = specWrapRef.current
+        const canvas = specCanvasRef.current
+        if (!wrap || !canvas) return
+
+        const rect = canvas.getBoundingClientRect()
+        const px = e.clientX - rect.left
+        const py = e.clientY - rect.top
+        const W = rect.width, H = rect.height
+
+        const { xScale } = makeScales(W, H, pad, spec.fMin, spec.fMax, 0, spec.yMax)
+        if (px < pad.l || px > (W - pad.r) || py < pad.t || py > (H - pad.b)) {
+          setTipSpec({show:false})
+          return
+        }
+
+        const allF = [
+          ...spec.negFreqs.map(f=>({f, origin:'neg'})),
+          ...spec.posFreqs.map(f=>({f, origin:'pos'}))
+        ]
+
+        let best = null, bestDx = Infinity
+        for (const it of allF){
+          const xi = xScale(it.f)
+          const dx = Math.abs(xi - px)
+          if (dx < bestDx) { bestDx = dx; best = it }
+        }
+
+        if (!best || bestDx > 10) {
+          setTipSpec({show:false})
+          return
+        }
+
+        // pega magnitudes correspondentes
+        const pick = (arrF, arrA, f) => {
+          for (let i=0;i<arrF.length;i++){
+            if (Math.abs(arrF[i]-f) < 1e-9) return arrA[i]
+          }
+          return 0
+        }
+
+        const magRef = best.origin==='neg'
+          ? pick(spec.negFreqs, spec.negAmps, best.f)
+          : pick(spec.posFreqs, spec.posAmps, best.f)
+
+        const magPass = best.origin==='neg'
+          ? pick(spec.negFreqs, spec.negPass, best.f)
+          : pick(spec.posFreqs, spec.posPass, best.f)
+
+        const wrapRect = wrap.getBoundingClientRect()
+        setTipSpec({
+          show:true,
+          x: e.clientX - wrapRect.left + 12,
+          y: e.clientY - wrapRect.top + 12,
+          text: `f=${best.f.toFixed(3)} Hz | origem=${best.origin==='neg' ? '(-f0)' : '(+f0)'} | |X| ref=${magRef.toFixed(4)} | após LPF=${magPass.toFixed(4)}`
+        })
+      }, [spec])
+
+      const aliasRisk = discrete && (fs < 2*f0)
+
+      return (
+        <div className="wrap">
+          <style>{`
+            :root{
+              --bg:#f6f7fb; --panel:#ffffff; --panel2:#f1f3f8; --ink:#0f172a; --inkDim:#475569;
+              --border:#d8dee9; --input:#ffffff; --inputBorder:#cbd5e1;
+              --canvas:#ffffff; --gridV:#d1d5db; --gridH:#e5e7eb; --frame:#94a3b8;
+
+              --orig:#64748b; --recon:#2563eb; --danger:#dc2626; --accent:#2563eb;
+
+              --pass:#22c55e; --passLine:#16a34a;
+
+              /* ✅ CORES DO ESPECTRO PEDIDAS */
+              --negPulse: var(--danger);     /* negativo = vermelho */
+              --posPulse: var(--ink);        /* positivo = preto (no dark vira "ink" claro) */
+            }
+            :root[data-theme="dark"]{
+              --bg:#0f1420; --panel:#151b2a; --panel2:#121828; --ink:#e8eefc; --inkDim:#a8b2c8;
+              --border:#1b2235; --input:#0e1424; --inputBorder:#2a3859;
+              --canvas:#0d1322; --gridV:#2a334a; --gridH:#1f293b; --frame:#223252;
+
+              --orig:#94a3b8; --recon:#9ad5ff; --danger:#ff3b3b; --accent:#3b82f6;
+
+              --pass:#34d399; --passLine:#10b981;
+
+              /* mantém a lógica: neg = vermelho; pos = ink (claro no dark) */
+              --negPulse: var(--danger);
+              --posPulse: var(--ink);
+            }
+
+            *{ box-sizing:border-box; }
+            body{ margin:0; background:var(--bg); color:var(--ink);
+              font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }
+
+            .wrap{ max-width:1100px; margin:0 auto; padding:18px 14px 40px; }
+            .topbar{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+            h1{ margin:0; font-size:18px; font-weight:700; letter-spacing:.2px; }
+            .subtitle{ margin:6px 0 0; font-size:13px; color:var(--inkDim); }
+
+            .panel{ background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px;
+              box-shadow:0 6px 18px rgba(0,0,0,.10); }
+            .panelHead{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
+            .panelTitle{ font-weight:650; font-size:14px; color:var(--ink); }
+            .panelRight{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+
+            .grid{ display:grid; grid-template-columns: 1fr 360px; gap:12px; }
+            @media(max-width: 980px){ .grid{ grid-template-columns:1fr; } }
+
+            .control{ background:var(--panel2); border:1px solid var(--border); border-radius:10px; padding:10px; margin-bottom:10px; }
+            .ctlLabel{ display:block; font-size:13px; color:var(--inkDim); margin-bottom:8px; }
+            .ctlBody{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+            input[type=range]{ width:100%; accent-color: var(--accent); }
+
+            input[type=number], select{ width:140px; background:var(--input); color:var(--ink);
+              border:1px solid var(--inputBorder); border-radius:8px; padding:6px 8px; font-size:14px; }
+            input:disabled, select:disabled{ opacity:.55; cursor:not-allowed; }
+
+            .pill{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px;
+              border:1px solid var(--border); background:var(--panel2); color:var(--inkDim); font-size:13px; white-space:nowrap; }
+            .pillStrong{ border:1px solid var(--accent); color:var(--ink); box-shadow:0 6px 18px rgba(37,99,235,.10); }
+            .pillWarn{ border:1px solid var(--danger); color:var(--ink); box-shadow:0 6px 18px rgba(220,38,38,.10); }
+
+            .btn{ border:1px solid var(--border); background:var(--panel2); color:var(--ink);
+              padding:8px 10px; border-radius:10px; cursor:pointer; font-size:13px; }
+            .btn.primary{ border-color: var(--accent); box-shadow:0 6px 18px rgba(37,99,235,.10); }
+            .btn:disabled{ opacity:.55; cursor:not-allowed; }
+
+            .toggle{ display:flex; align-items:center; justify-content:space-between;
+              background:var(--panel2); border:1px solid var(--border); border-radius:10px;
+              padding:8px 10px; color:var(--inkDim); font-size:13px; gap:10px; width:100%; }
+            .toggle input{ transform: scale(1.15); }
+
+            canvas.main{ width:100%; height:260px; display:block; background:var(--canvas);
+              border-radius:12px; border:1px solid var(--border); }
+
+            .note{ font-size:12px; color:var(--inkDim); line-height:1.35; margin:0 0 6px; }
+            .hr{ height:1px; background:var(--border); margin:10px 0; opacity:.8; }
+            .plotWrap{ position:relative; }
+
+            .tip{ position:absolute; pointer-events:none; max-width:520px; padding:8px 10px; border-radius:10px;
+              border:1px solid var(--border); background:var(--panel); color:var(--ink); font-size:12px;
+              box-shadow:0 10px 26px rgba(0,0,0,.22); white-space:nowrap; z-index:5; }
+
+            .modalOverlay{ position:fixed; inset:0; background:rgba(0,0,0,.45);
+              display:flex; align-items:center; justify-content:center; padding:16px; z-index:1000; }
+            .modal{ width:min(920px, 96vw); background:var(--panel); border:1px solid var(--border);
+              border-radius:12px; box-shadow:0 20px 60px rgba(0,0,0,.35); overflow:hidden; }
+            .modalHead{ display:flex; align-items:center; justify-content:space-between;
+              padding:12px 12px 8px; border-bottom:1px solid var(--border); }
+            .modalTitle{ font-weight:650; font-size:14px; }
+            .iconBtn{ border:1px solid var(--border); background:var(--panel2); color:var(--ink);
+              border-radius:10px; width:36px; height:32px; cursor:pointer; }
+            .modalBody{ padding:12px; }
+          `}</style>
+
+          <div className="topbar">
+            <div>
+              <h1>Amostragem no domínio da frequência</h1>
+            </div>
+
+            <div style={{display:'flex', gap:10, alignItems:'center'}}>
+              <select value={theme} onChange={e=>setTheme(e.target.value)}>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="grid">
+            <Panel
+              title="Visualização"
+              right={
+                <>
+                  <Pill strong>f0: <b>{f0.toFixed(0)}</b> Hz</Pill>
+                  <Pill strong>Fs: <b>{fs.toFixed(1)}</b> Hz</Pill>
+                  <Pill>Nyquist: <b>{(fs/2).toFixed(1)}</b> Hz</Pill>
+                  <Pill strong>fc: <b>{fcEff.toFixed(1)}</b> Hz</Pill>
+                  {aliasRisk && <Pill warn>⚠ aliasing (Fs &lt; 120 Hz)</Pill>}
+                </>
+              }
+            >
+              <div style={{display:'grid', gap:12}}>
+                <div className="plotWrap" ref={timeWrapRef}>
+                  <div className="note"><b>Tempo</b> — {discrete ? 'Deltas de Dirac' : 'senoide contínua'}</div>
+                  <canvas
+                    className="main"
+                    ref={timeCanvasRef}
+                    onMouseMove={onTimeMove}
+                    onMouseLeave={()=>setTipTime({show:false})}
+                  />
+                  <Tooltip state={tipTime} />
+                </div>
+
+                <div className="plotWrap" ref={specWrapRef}>
+                  <div className="note">
+                    <b>Frequência</b> — {discrete ? 'réplicas (k·Fs ± 60)' : 'deltas em ±60'}
+                    {useLPF ? ` | LPF ativo (fc=${fcEff.toFixed(1)} Hz${autoFc ? ', auto' : ''})` : ''} 
+                  </div>
+                  <canvas
+                    className="main"
+                    ref={specCanvasRef}
+                    onMouseMove={onSpecMove}
+                    onMouseLeave={()=>setTipSpec({show:false})}
+                  />
+                  <Tooltip state={tipSpec} />
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="Controles">
+              <div className="control">
+                <div className="ctlLabel">Amostragem</div>
+                <div className="ctlBody">
+                  <Toggle label="Discretizar (Deltas de Dirac)" checked={discrete} onChange={(v)=>{
+                    setDiscrete(v)
+                    if (!v) setShowFiltered(false)
+                  }} />
+
+                  <div style={{flex:'1 1 160px', minWidth:220}}>
+                    <div className="note" style={{margin:'0 0 6px'}}>Fs (Hz) — 1 a 1000</div>
+                    <input
+                      type="range" min="1" max="1000" step="1"
+                      value={fs}
+                      disabled={!discrete}
+                      onChange={e=>setFs(Number(e.target.value))}
+                    />
+                  </div>
+
+                  <input
+                    type="number" min="1" max="1000" step="1"
+                    value={fs}
+                    disabled={!discrete}
+                    onChange={e=>setFs(Number(e.target.value))}
+                  />
+                </div>
+              </div>
+
+              <div className="control">
+                <div className="ctlLabel">Filtro ideal passa-baixas</div>
+
+                <div className="ctlBody" style={{alignItems:'stretch'}}>
+                  <Toggle
+                    label="Ativar LPF ideal"
+                    checked={useLPF}
+                    onChange={(v)=>{ setUseLPF(v); if(!v) setShowFiltered(false) }}
+                  />
+                </div>
+
+                <div className="hr"></div>
+
+                <div className="ctlBody" style={{alignItems:'stretch'}}>
+                  <Toggle
+                    label="fc automático (fc = Fs/2)"
+                    checked={autoFc}
+                    disabled={!useLPF}
+                    onChange={setAutoFc}
+                  />
+
+                  <div style={{flex:'1 1 160px', minWidth:220}}>
+                    <div className="note" style={{margin:'0 0 6px'}}>
+                      fc (Hz) {autoFc ? '(auto)' : '(manual)'}
+                    </div>
+                    <input
+                      type="range" min="0.1" max="200" step="0.1"
+                      value={autoFc ? fcEff : fcManual}
+                      disabled={!useLPF || autoFc}
+                      onChange={e=>setFcManual(Number(e.target.value))}
+                    />
+                  </div>
+
+                  <input
+                    type="number" min="0.1" max="2000" step="0.1"
+                    value={autoFc ? fcEff : fcManual}
+                    disabled={!useLPF || autoFc}
+                    onChange={e=>setFcManual(Number(e.target.value))}
+                  />
+                </div>
+
+                <div className="hr"></div>
+
+                <div className="ctlBody" style={{justifyContent:'space-between'}}>
+                  <Btn
+                    variant="primary"
+                    disabled={!useLPF}
+                    onClick={()=>{ if(useLPF) setShowFiltered(true) }}
+                  >
+                    Ver sinal reconstruído
+                  </Btn>
+                </div>
+              </div>
+            </Panel>
+          </div>
+
+          <Modal
+            open={showFiltered}
+            title="Sinal no tempo: original vs reconstruído"
+            onClose={()=>setShowFiltered(false)}
+          >
+
+            <div style={{display:'flex', gap:10, flexWrap:'wrap', marginBottom:10}}>
+              <Toggle label="Original" checked={showOrigInModal} onChange={setShowOrigInModal} />
+              <Toggle label="Reconstruído (LP ideal)" checked={showReconInModal} onChange={setShowReconInModal} />
+            </div>
+
+            <canvas className="main" ref={reconCanvasRef} />
+
+          </Modal>
+        </div>
+      )
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App/>)
+  </script>
+</body>
+</html>
