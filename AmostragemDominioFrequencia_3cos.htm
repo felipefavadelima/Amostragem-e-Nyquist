@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Amostragem no domínio da Frequência — 3 cossenoides + áudio</title>
+  <title>Amostragem no domínio da Frequência</title>
 
   <script>
     (function () {
@@ -215,13 +215,58 @@
     }
 
     // =====================
-    // DSP helpers
+    // DSP helper
     // =====================
     function wrapToNyquist(f, Fs) {
-      // [-Fs/2, Fs/2)
       const half = Fs/2
       let x = ((f + half) % Fs + Fs) % Fs // [0, Fs)
-      return x - half
+      return x - half // [-Fs/2, Fs/2)
+    }
+
+    // =====================
+    // WAV helpers (PCM16)
+    // =====================
+    function floatToPCM16(x) {
+      const v = Math.max(-1, Math.min(1, x))
+      return v < 0 ? Math.round(v * 32768) : Math.round(v * 32767)
+    }
+
+    function writeString(view, offset, str) {
+      for (let i=0;i<str.length;i++) view.setUint8(offset+i, str.charCodeAt(i))
+    }
+
+    function makeWavBlobFromMonoFloat32(samplesFloat32, sampleRate) {
+      const numChannels = 1
+      const bitsPerSample = 16
+      const blockAlign = numChannels * bitsPerSample/8
+      const byteRate = sampleRate * blockAlign
+      const dataSize = samplesFloat32.length * blockAlign
+      const buffer = new ArrayBuffer(44 + dataSize)
+      const view = new DataView(buffer)
+
+      writeString(view, 0, 'RIFF')
+      view.setUint32(4, 36 + dataSize, true)
+      writeString(view, 8, 'WAVE')
+
+      writeString(view, 12, 'fmt ')
+      view.setUint32(16, 16, true)
+      view.setUint16(20, 1, true) // PCM
+      view.setUint16(22, numChannels, true)
+      view.setUint32(24, sampleRate, true)
+      view.setUint32(28, byteRate, true)
+      view.setUint16(32, blockAlign, true)
+      view.setUint16(34, bitsPerSample, true)
+
+      writeString(view, 36, 'data')
+      view.setUint32(40, dataSize, true)
+
+      let off = 44
+      for (let i=0;i<samplesFloat32.length;i++){
+        view.setInt16(off, floatToPCM16(samplesFloat32[i]), true)
+        off += 2
+      }
+
+      return new Blob([buffer], { type: 'audio/wav' })
     }
 
     // =====================
@@ -290,20 +335,21 @@
         document.documentElement.setAttribute('data-theme', theme)
       }, [theme])
 
-      // 3 cossenoides (amplitude 1.0 cada)
-      const [on480, setOn480]   = useState(true)
-      const [on720, setOn720]   = useState(false)
-      const [on1200, setOn1200] = useState(false)
+      // Frequências pedidas
+      const F1 = 500, F2 = 1300, F3 = 2100
+
+      const [on500, setOn500] = useState(true)
+      const [on1300, setOn1300] = useState(true)
+      const [on2100, setOn2100] = useState(true)
 
       const enabled = useMemo(() => ([
-        on480  ? 480  : null,
-        on720  ? 720  : null,
-        on1200 ? 1200 : null,
-      ].filter(v=>v!=null)), [on480, on720, on1200])
+        on500 ? F1 : null,
+        on1300 ? F2 : null,
+        on2100 ? F3 : null,
+      ].filter(v=>v!=null)), [on500, on1300, on2100])
 
-      // amostragem
-      const [discrete, setDiscrete] = useState(true)
-      const [fs, setFs] = useState(4000) // 200..12000
+      // discretização SEMPRE ativa
+      const [fs, setFs] = useState(2400) // 200..12000
       const fc = useMemo(() => fs/2, [fs])
 
       // visualização no tempo
@@ -320,28 +366,44 @@
       const [showReconInModal, setShowReconInModal] = useState(true)
 
       // =====================
-      // ÁUDIO — versão "bulletproof" para GitHub Pages
-      // - Sempre gera buffer em 44100 Hz.
-      // - Reconstruído: f_alias = wrapToNyquist(f, Fs) (LP ideal fc=Fs/2).
-      // - "Unlock" com oscillator curtíssimo.
-      // - Cria AudioContext no clique (e fecha o anterior) pra evitar estados bugados.
+      // ÁUDIO via <audio> — SEMPRE do sinal RECONSTRUÍDO (alias/baseband)
       // =====================
-      const audioRef = useRef({ ctx:null, source:null, gain:null })
+      const audioElRef = useRef(null)
+      const audioUrlRef = useRef(null)
       const [isPlaying, setIsPlaying] = useState(false)
-      const [audioState, setAudioState] = useState('idle')
 
       const stopAudio = useCallback(() => {
-        const st = audioRef.current
-        try { st?.source?.stop(0) } catch {}
-        st.source = null
+        const el = audioElRef.current
+        if (el) {
+          el.pause()
+          el.currentTime = 0
+        }
         setIsPlaying(false)
-        setAudioState(st?.ctx ? st.ctx.state : 'idle')
       }, [])
 
-      // se mudar parâmetros enquanto toca, para
+      useEffect(() => {
+        const el = audioElRef.current
+        if (!el) return
+
+        const onEnded = () => {
+          setIsPlaying(false)
+          if (audioUrlRef.current) {
+            URL.revokeObjectURL(audioUrlRef.current)
+            audioUrlRef.current = null
+          }
+        }
+        el.addEventListener('ended', onEnded)
+        return () => el.removeEventListener('ended', onEnded)
+      }, [])
+
+      // se mudar parâmetros enquanto toca, para e limpa URL
       useEffect(() => {
         if (isPlaying) stopAudio()
-      }, [isPlaying, stopAudio, fs, on480, on720, on1200, showFiltered, showOrigInModal, showReconInModal])
+        if (audioUrlRef.current) {
+          URL.revokeObjectURL(audioUrlRef.current)
+          audioUrlRef.current = null
+        }
+      }, [fs, on500, on1300, on2100])
 
       function synthCosSum(t, freqs) {
         let y = 0
@@ -351,106 +413,48 @@
         return y
       }
 
-      function buildBuffer(ctx, freqsForAudio) {
+      const playAudio = useCallback(async () => {
+        const el = audioElRef.current
+        if (!el) return
+
+        const fOrig = enabled.slice()
+        if (fOrig.length === 0) return
+
+        const fAlias = fOrig.map(f => wrapToNyquist(f, fs))
+
         const sr = 44100
         const dur = 5.0
         const N = Math.floor(sr * dur)
 
-        const buf = ctx.createBuffer(1, N, sr)
-        const ch0 = buf.getChannelData(0)
+        const scale = 0.90 / Math.max(1, fAlias.length)
 
-        const nTones = freqsForAudio.length
-        const scale = 0.9 / Math.max(1, nTones)
-
+        const samples = new Float32Array(N)
         for (let i=0;i<N;i++){
           const t = i / sr
-          ch0[i] = scale * synthCosSum(t, freqsForAudio)
+          samples[i] = scale * synthCosSum(t, fAlias)
         }
-        return buf
-      }
 
-      function unlockAudio(ctx) {
-        // Oscillator curto e praticamente inaudível — destrava WebAudio em Safari/iOS e alguns casos chatos
-        const o = ctx.createOscillator()
-        const g = ctx.createGain()
-        g.gain.value = 0.00001
-        o.connect(g)
-        g.connect(ctx.destination)
-        o.start()
-        o.stop(ctx.currentTime + 0.006)
-      }
+        if (audioUrlRef.current) {
+          URL.revokeObjectURL(audioUrlRef.current)
+          audioUrlRef.current = null
+        }
 
-      const playAudio = useCallback(() => {
-        const fOrig = enabled.slice()
-        if (fOrig.length === 0) return
+        const wavBlob = makeWavBlobFromMonoFloat32(samples, sr)
+        const url = URL.createObjectURL(wavBlob)
+        audioUrlRef.current = url
 
-        const wantRecon = showFiltered && showReconInModal
-        const fRecon = fOrig.map(f => wrapToNyquist(f, fs))
-        const freqsForAudio = wantRecon ? fRecon : fOrig
+        el.src = url
+        el.currentTime = 0
 
-        // Fecha qualquer contexto anterior (evita "silêncio" por estado ruim)
         try {
-          if (audioRef.current?.ctx && audioRef.current.ctx.state !== 'closed') {
-            try { audioRef.current.source?.stop(0) } catch {}
-            audioRef.current.source = null
-            audioRef.current.gain = null
-            audioRef.current.ctx.close()
-          }
-        } catch {}
-
-        const Ctx = window.AudioContext || window.webkitAudioContext
-        const ctx = new Ctx()
-        audioRef.current.ctx = ctx
-        setAudioState(ctx.state)
-
-        const startNow = () => {
-          try {
-            unlockAudio(ctx)
-
-            const gain = ctx.createGain()
-            gain.gain.value = 0.9
-            gain.connect(ctx.destination)
-            audioRef.current.gain = gain
-
-            const buf = buildBuffer(ctx, freqsForAudio)
-
-            const src = ctx.createBufferSource()
-            src.buffer = buf
-            src.connect(gain)
-
-            src.onended = () => {
-              setIsPlaying(false)
-              setAudioState(ctx.state)
-              audioRef.current.source = null
-            }
-
-            audioRef.current.source = src
-            setIsPlaying(true)
-            setAudioState(ctx.state)
-
-            src.start(0)
-          } catch (err) {
-            console.warn('Erro ao iniciar áudio:', err)
-            setIsPlaying(false)
-            setAudioState(ctx.state)
-            alert('Falha ao iniciar o áudio. Veja o console (F12).')
-          }
+          await el.play()
+          setIsPlaying(true)
+        } catch (err) {
+          console.warn('HTMLAudio play() bloqueado:', err)
+          alert('O navegador bloqueou a reprodução. Tente clicar novamente ou verifique se a aba/site não está mutado.')
+          setIsPlaying(false)
         }
-
-        // Alguns browsers precisam do resume() (sem await pra não "perder" o gesto do clique)
-        if (ctx.state === 'suspended') {
-          ctx.resume().then(() => {
-            setAudioState(ctx.state)
-            startNow()
-          }).catch(err => {
-            console.warn('resume() falhou:', err)
-            setAudioState(ctx.state)
-            alert('O navegador bloqueou o áudio (resume falhou).')
-          })
-        } else {
-          startNow()
-        }
-      }, [enabled, fs, showFiltered, showReconInModal])
+      }, [enabled, fs])
 
       // =====================
       // Tempo: contínuo + amostras
@@ -495,10 +499,10 @@
       }, [timeData])
 
       // =====================
-      // Espectro (visual)
+      // Espectro (visual) — eixo FIXO: [-2500, 2500]
       // =====================
-      const SPEC_MIN = -6000
-      const SPEC_MAX =  6000
+      const SPEC_MIN = -2500
+      const SPEC_MAX =  2500
 
       const spec = useMemo(() => {
         const baseAmp = 0.5
@@ -507,9 +511,9 @@
         const freqs = []
         const amps  = []
 
-        const spanGen = Math.max(2.2*fs, 6000)
-        const fMinG = -spanGen
-        const fMaxG =  spanGen
+        // Gerar réplicas suficientes para cobrir exatamente o eixo fixo
+        const fMinG = SPEC_MIN
+        const fMaxG = SPEC_MAX
 
         for (const f0 of enabled) {
           const kMin = Math.floor((fMinG - f0) / fs) - 1
@@ -520,7 +524,7 @@
           }
         }
 
-        // dedup
+        // dedup por frequência
         const seen = new Set()
         const uf = []
         const ua = []
@@ -533,7 +537,7 @@
           }
         }
 
-        // janela
+        // recorta pela janela fixa
         const wf = []
         const wa = []
         for (let i=0;i<uf.length;i++){
@@ -547,7 +551,7 @@
       }, [enabled, fs])
 
       // =====================
-      // Reconstrução (tempo) — LP ideal fc=Fs/2 (alias para baseband)
+      // Reconstrução (tempo)
       // =====================
       const reconTime = useMemo(() => {
         const aliased = enabled.map(f => wrapToNyquist(f, fs))
@@ -618,23 +622,19 @@
         ctx.lineTo(W-pad.r, yScale(0))
         ctx.stroke()
 
-        if (!discrete) {
-          drawLine(ctx, timeData.x, timeData.y, xScale, yScale, '--recon', 2.2)
-        } else {
-          drawLine(ctx, timeData.x, timeData.y, xScale, yScale, '--orig', 1.2)
-          drawStems(ctx, timeData.xs, timeData.ys, xScale, yScale, 0, '--recon')
-        }
+        drawLine(ctx, timeData.x, timeData.y, xScale, yScale, '--orig', 1.2)
+        drawStems(ctx, timeData.xs, timeData.ys, xScale, yScale, 0, '--recon')
 
         ctx.fillStyle = getCSSVar('--inkDim')
         ctx.font = '12px system-ui, sans-serif'
         ctx.textAlign = 'left'
-        ctx.fillText(discrete ? 'Tempo: contínuo + amostras' : 'Tempo: sinal contínuo', pad.l, 14)
-      }, [timeData, discrete, timeYRange, fs, enabled, theme])
+        ctx.fillText('Tempo', pad.l, 14)
+      }, [timeData, timeYRange, fs, enabled, theme])
 
       useCanvas(timeCanvasRef, drawTime)
 
       // =====================
-      // Draw spectrum
+      // Draw spectrum (eixo fixo)
       // =====================
       const specWrapRef = useRef(null)
       const specCanvasRef = useRef(null)
@@ -650,18 +650,15 @@
         const { xScale, yScale } = makeScales(W, H, pad, spec.fMin, spec.fMax, 0, spec.yMax)
         drawAxesLabels(ctx, W, H, pad, 'Frequência (Hz)', 'Magnitude (visual)')
 
-        // passband reconstrução (sempre fc=Fs/2 quando discreto)
-        if (discrete) {
-          const yTop = pad.t
-          const yBot = H - pad.b
-          drawPassband(ctx, xScale, yTop, yBot, fc, '--pass')
+        const yTop = pad.t
+        const yBot = H - pad.b
+        drawPassband(ctx, xScale, yTop, yBot, fc, '--pass')
 
-          ctx.strokeStyle = getCSSVar('--passLine')
-          ctx.lineWidth = 1.6
-          const x1 = xScale(-fc), x2 = xScale(fc)
-          ctx.beginPath(); ctx.moveTo(x1, pad.t); ctx.lineTo(x1, H-pad.b); ctx.stroke()
-          ctx.beginPath(); ctx.moveTo(x2, pad.t); ctx.lineTo(x2, H-pad.b); ctx.stroke()
-        }
+        ctx.strokeStyle = getCSSVar('--passLine')
+        ctx.lineWidth = 1.6
+        const x1 = xScale(-fc), x2 = xScale(fc)
+        ctx.beginPath(); ctx.moveTo(x1, pad.t); ctx.lineTo(x1, H-pad.b); ctx.stroke()
+        ctx.beginPath(); ctx.moveTo(x2, pad.t); ctx.lineTo(x2, H-pad.b); ctx.stroke()
 
         ctx.strokeStyle = getCSSVar('--gridV')
         ctx.lineWidth = 1
@@ -675,16 +672,13 @@
         ctx.fillStyle = getCSSVar('--inkDim')
         ctx.font = '12px system-ui, sans-serif'
         ctx.textAlign = 'left'
-        const lbl = discrete
-          ? `Espectro (amostrado): réplicas em k·Fs ± fi | recon: LP ideal fc=Fs/2=${fc.toFixed(0)} Hz`
-          : 'Espectro (contínuo): deltas em ±fi'
-        ctx.fillText(lbl, pad.l, 14)
-      }, [spec, discrete, fc, theme])
+        ctx.fillText(`Frequência`, pad.l, 14)
+      }, [spec, fc, theme])
 
       useCanvas(specCanvasRef, drawSpec)
 
       // =====================
-      // Modal draw: original + reconstruído
+      // Modal draw
       // =====================
       const reconCanvasRef = useRef(null)
 
@@ -709,7 +703,7 @@
         ctx.font = '12px system-ui, sans-serif'
         ctx.textAlign = 'left'
         const ali = reconTime.aliased.map(f=>f.toFixed(2)).join(', ')
-        ctx.fillText(`Original + Reconstrução | f_alias (Hz): ${ali}`, pad.l, 14)
+        ctx.fillText(`Original + Reconstrução`, pad.l, 14)
       }, [reconTime, timeData, modalYRange, showOrigInModal, showReconInModal, theme])
 
       useEffect(() => { if (showFiltered) drawRecon() }, [showFiltered, drawRecon])
@@ -737,22 +731,18 @@
         const t = xInv(px)
         const y = synthCosSum(t, enabled)
 
-        let extra = ''
-        if (discrete) {
-          const n = Math.round(t * fs)
-          const ts = n / fs
-          const ys = synthCosSum(ts, enabled)
-          extra = ` | amostra: t=${ts.toFixed(6)} s, y=${ys.toFixed(4)}`
-        }
+        const n = Math.round(t * fs)
+        const ts = n / fs
+        const ys = synthCosSum(ts, enabled)
 
         const wrapRect = wrap.getBoundingClientRect()
         setTipTime({
           show:true,
           x: e.clientX - wrapRect.left + 12,
           y: e.clientY - wrapRect.top + 12,
-          text: `t=${t.toFixed(6)} s, y=${y.toFixed(4)}${extra}`
+          text: `t=${t.toFixed(6)} s, y(cont)=${y.toFixed(4)} | amostra: t=${ts.toFixed(6)} s, y=${ys.toFixed(4)}`
         })
-      }, [fs, discrete, enabled, Tview, timeYRange])
+      }, [fs, enabled, Tview, timeYRange])
 
       const onSpecMove = useCallback((e) => {
         const wrap = specWrapRef.current
@@ -791,12 +781,16 @@
       }, [spec, fc])
 
       const aliasRisk = useMemo(() => {
-        if (!discrete) return false
         const half = fs/2
         return enabled.some(f => f > half)
-      }, [discrete, fs, enabled])
+      }, [fs, enabled])
 
       const enabledStr = enabled.length ? enabled.join(', ') : 'nenhuma'
+
+      const aliasStr = useMemo(() => {
+        const ali = enabled.map(f => wrapToNyquist(f, fs))
+        return ali.map(v => v.toFixed(2)).join(', ')
+      }, [enabled, fs])
 
       return (
         <div className="wrap">
@@ -884,11 +878,7 @@
 
           <div className="topbar">
             <div>
-              <h1>Amostragem no domínio da frequência — 3 cossenoides</h1>
-              <div className="subtitle">
-                Sinal original = soma das cossenoides ligadas (480, 720, 1200 Hz). Reconstrução: LP ideal com <b>fc=Fs/2</b>.
-                Áudio: 5 s em 44100 Hz (reconstruído = alias em baseband).
-              </div>
+              <h1>Amostragem no domínio da frequência</h1>
             </div>
 
             <div style={{display:'flex', gap:10, alignItems:'center'}}>
@@ -907,15 +897,13 @@
                   <Pill strong>tons (Hz): <b>{enabledStr}</b></Pill>
                   <Pill strong>Fs: <b>{fs.toFixed(0)}</b> Hz</Pill>
                   <Pill>Nyquist: <b>{(fs/2).toFixed(0)}</b> Hz</Pill>
-                  <Pill strong>fc: <b>{(fs/2).toFixed(0)}</b> Hz</Pill>
-                  {aliasRisk && <Pill warn>⚠ aliasing (algum tom &gt; Fs/2)</Pill>}
-                  <Pill>audio ctx: <b>{audioState}</b></Pill>
+                  {aliasRisk && <Pill warn>⚠ aliasing</Pill>}
                 </>
               }
             >
               <div style={{display:'grid', gap:12}}>
                 <div className="plotWrap" ref={timeWrapRef}>
-                  <div className="note"><b>Tempo</b> — {discrete ? 'contínuo + amostras' : 'contínuo'} (janela: {(Tview*1000).toFixed(1)} ms)</div>
+                  <div className="note"><b>Tempo</b> — contínuo + amostras (janela: {(Tview*1000).toFixed(1)} ms)</div>
                   <canvas
                     className="main"
                     ref={timeCanvasRef}
@@ -926,9 +914,6 @@
                 </div>
 
                 <div className="plotWrap" ref={specWrapRef}>
-                  <div className="note">
-                    <b>Frequência</b> — réplicas (k·Fs ± fi) | passband (recon): |f|≤fc=Fs/2={fc.toFixed(0)} Hz
-                  </div>
                   <canvas
                     className="main"
                     ref={specCanvasRef}
@@ -942,28 +927,22 @@
 
             <Panel title="Controles">
               <div className="control">
-                <div className="ctlLabel">Cossenoides no sinal original</div>
+                <div className="ctlLabel">Sinal</div>
                 <div className="ctlBody" style={{alignItems:'stretch'}}>
-                  <Toggle label="cos 480 Hz" checked={on480} onChange={setOn480} />
-                  <Toggle label="cos 720 Hz" checked={on720} onChange={setOn720} />
-                  <Toggle label="cos 1200 Hz" checked={on1200} onChange={setOn1200} />
+                  <Toggle label="500 Hz" checked={on500} onChange={setOn500} />
+                  <Toggle label="1300 Hz" checked={on1300} onChange={setOn1300} />
+                  <Toggle label="2100 Hz" checked={on2100} onChange={setOn2100} />
                 </div>
               </div>
 
               <div className="control">
-                <div className="ctlLabel">Amostragem</div>
+                <div className="ctlLabel">Frequência de amostragem</div>
                 <div className="ctlBody">
-                  <Toggle label="Discretizar (amostrar)" checked={discrete} onChange={(v)=>{
-                    setDiscrete(v)
-                    if (!v) setShowFiltered(false)
-                  }} />
-
                   <div style={{flex:'1 1 180px', minWidth:240}}>
                     <div className="note" style={{margin:'0 0 6px'}}>Fs (Hz) — 200 a 12000</div>
                     <input
                       type="range" min="200" max="12000" step="10"
                       value={fs}
-                      disabled={!discrete}
                       onChange={e=>setFs(Number(e.target.value))}
                     />
                   </div>
@@ -971,7 +950,6 @@
                   <input
                     type="number" min="200" max="12000" step="10"
                     value={fs}
-                    disabled={!discrete}
                     onChange={e=>setFs(Number(e.target.value))}
                   />
                 </div>
@@ -981,8 +959,7 @@
                 <div className="ctlBody" style={{justifyContent:'space-between'}}>
                   <Btn
                     variant="primary"
-                    disabled={!discrete}
-                    onClick={()=>{ if(discrete) setShowFiltered(true) }}
+                    onClick={()=> setShowFiltered(true)}
                   >
                     Ver sinal reconstruído
                   </Btn>
@@ -992,14 +969,10 @@
                     disabled={enabled.length===0}
                     onClick={()=>{ isPlaying ? stopAudio() : playAudio() }}
                   >
-                    {isPlaying ? "Parar áudio" : "Reproduzir áudio (5s)"}
+                    {isPlaying ? "Parar áudio" : "Reproduzir áudio reconstruído (5s)"}
                   </Btn>
                 </div>
-
-                <div className="note" style={{marginTop:8}}>
-                  Áudio: se o modal estiver aberto e “Reconstruído” estiver marcado, toca a reconstrução (alias na baseband).
-                  Caso contrário, toca o original.
-                </div>
+                <audio ref={audioElRef} style={{width:'100%', marginTop:10}} controls />
               </div>
             </Panel>
           </div>
@@ -1013,11 +986,6 @@
               <Toggle label="Original" checked={showOrigInModal} onChange={setShowOrigInModal} />
               <Toggle label="Reconstruído (LP ideal)" checked={showReconInModal} onChange={setShowReconInModal} />
             </div>
-
-            <div className="note" style={{marginBottom:10}}>
-              Reconstrução: <b>f_alias = wrapToNyquist(fi, Fs)</b> e soma de cossenos no tempo.
-            </div>
-
             <canvas className="main" ref={reconCanvasRef} />
           </Modal>
         </div>
